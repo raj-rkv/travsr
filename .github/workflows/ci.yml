@@ -164,7 +164,7 @@ jobs:
       # that cites the MSRV needs rereading, not just renumbering; the 1.75
       # bump left a Cargo.toml note whose reason had expired at the new value.
       - name: Install Rust toolchain (1.88.0)
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
