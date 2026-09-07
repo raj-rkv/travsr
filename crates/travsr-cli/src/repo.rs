@@ -117,6 +117,164 @@ fn main_worktree_root(worktree_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether two resolved repo roots name the **same directory**.
+///
+/// Deliberately not `a == b`. The two sides reach this comparison by different
+/// routes and are not spelled alike even when they are one directory: the
+/// caller's own root is walked up from `cwd` and is therefore native, while a
+/// served root is derived from `git rev-parse --git-common-dir`, which on
+/// Windows renders forward slashes (`C:/repo/.git`) where the native path uses
+/// backslashes (`C:\repo\.git`). Windows and the default macOS filesystem are
+/// also case-insensitive, so `C:\Repo` and `c:\repo` are the same directory; a
+/// path may arrive as an 8.3 short name or as a UNC share
+/// (`\\server\share\repo`); and on macOS `/tmp` is a symlink to `/private/tmp`.
+/// A raw string compare reports "different tree" for every one of those.
+///
+/// `canonicalize` is the operating system's own answer to "which directory is
+/// this": a verbatim `\\?\`-prefixed path on Windows (long-path, case- and
+/// short-name-resolved, UNC included) and a fully resolved absolute path
+/// elsewhere. Only used for the comparison, never for display, so the user
+/// still sees the paths they typed.
+///
+/// A path that cannot be canonicalized (it does not exist, or is unreadable)
+/// counts as the **same** directory. The one caller uses this to decide whether
+/// to tell a user their answer came from another checkout, and that claim must
+/// never rest on a path this process could not resolve.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// `Some(worktree_root)` when `cwd` stands in a **linked worktree** whose read
+/// queries are answered out of `served_root`, a different checkout. That is the
+/// `PreferLocalElseMain` redirect at the top of this file, seen from the far
+/// end: the answer is correct about the main worktree and wrong about the tree
+/// the user is editing.
+///
+/// `None` for a standard repo, for a linked worktree that has its own
+/// `.travsr/` (no redirect happened), and whenever the two roots cannot be told
+/// apart.
+///
+/// Gated on `.git` being a gitlink *file*, which is true only inside a linked
+/// worktree. That keeps the signal scoped to the redirect it describes: an
+/// explicit `--db <other repo>` or a registry-resolved root also serves a
+/// different directory, but by the user's own instruction, and must not be
+/// narrated as a worktree mix-up.
+fn worktree_served_elsewhere(cwd: &Path, served_root: &Path) -> Option<PathBuf> {
+    let own = find_git_root_for_write(cwd).ok()?;
+    if !own.join(".git").is_file() {
+        return None;
+    }
+    (!same_directory(&own, served_root)).then_some(own)
+}
+
+/// State plainly that this answer describes another checkout.
+///
+/// The condition this replaces was reported as index staleness ("semantic
+/// analysis has not caught up with the current commit"), which describes a race
+/// inside one tree and is repaired by waiting or re-indexing. Neither helps
+/// here: the served index is a faithful description of a *different* checkout,
+/// and no amount of re-indexing it will make it describe this worktree. Naming
+/// both roots is the whole point, so a reader can see which tree the
+/// `path:line` they are about to trust belongs to.
+///
+/// `served_degraded` folds in the one true half of the freshness note this
+/// replaces: when the served index is itself Phase B degraded, an empty or
+/// short result from it is not authoritative, and a #302 user who decides the
+/// main index is what they wanted and keeps querying it needs to know that. The
+/// "wait / re-index / run `travsr status`" advice from the freshness note is
+/// dropped, because it reads as "this will catch up to your tree", which it
+/// never will.
+pub(crate) fn cross_checkout_note(
+    here: &Path,
+    served: &Path,
+    served_commit: Option<&str>,
+    served_degraded: bool,
+) -> String {
+    let commit = match served_commit.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!(" (indexed at commit {c})"),
+        None => String::new(),
+    };
+    let degraded = if served_degraded {
+        " That index's own call graph is also incomplete right now, so an empty \
+         or short result from it is not authoritative either."
+    } else {
+        ""
+    };
+    format!(
+        "[note: you are standing in the linked worktree {}, but travsr is \
+         answering from the index at {}{}, which is a different checkout. \
+         Everything it reports, including any path, line number or symbol, \
+         describes that tree, not this one. This is not index staleness: \
+         re-indexing that checkout will never make it describe this worktree. \
+         Run `travsr init` here to give this worktree its own index.{} \
+         (set TRAVSR_NO_WORKTREE_NOTE=1 to silence this note)]",
+        here.display(),
+        served.display(),
+        commit,
+        degraded
+    )
+}
+
+/// Production entry: `Some(worktree_root)` when the index at `db_path`
+/// (`<root>/.travsr/graph.db`) belongs to a checkout other than the linked
+/// worktree at `cwd`.
+///
+/// Filesystem only, so a caller can classify before deciding whether it is
+/// worth opening a store. `cwd` is a parameter rather than the process's own
+/// working directory so this stays a pure predicate a caller can unit-test, and
+/// so it compares the tree the caller actually resolved its root from rather
+/// than whatever the process cwd happens to be.
+pub(crate) fn served_by_other_checkout(cwd: &Path, db_path: &Path) -> Option<PathBuf> {
+    // `<root>/.travsr/graph.db` -> `<root>`.
+    let served = db_path.parent()?.parent()?;
+    worktree_served_elsewhere(cwd, served)
+}
+
+/// The note for [`served_by_other_checkout`], or `None` when the answer really
+/// does describe the tree the caller is standing in.
+///
+/// Classification only: `TRAVSR_NO_WORKTREE_NOTE` is deliberately **not** read
+/// here. `Some` means "this answer is about another checkout", which is also
+/// what tells a caller to drop its own hedged drift note — a claim that stays
+/// true when the user has merely asked not to read about it. Collapsing the two
+/// into one `None` would mean muting this note handed the user back the two
+/// misleading notes it replaces. The caller mutes the *print* via
+/// [`worktree_note_suppressed`]; see `travsr status`.
+///
+/// `served_commit` is the index's `last_commit` when the caller already has a
+/// store open, otherwise `None`; this resolver deliberately does not open one,
+/// so it passes `served_degraded = false`. The one caller is `travsr status`,
+/// whose stdout is counts and a commit, never a `path:line`, so the degraded
+/// caveat about empty results would not apply to anything it prints.
+pub(crate) fn cross_checkout_note_for_db(
+    cwd: &Path,
+    db_path: &Path,
+    served_commit: Option<&str>,
+) -> Option<String> {
+    let served = db_path.parent()?.parent()?;
+    let here = served_by_other_checkout(cwd, db_path)?;
+    Some(cross_checkout_note(&here, served, served_commit, false))
+}
+
+/// Escape hatch (`TRAVSR_NO_WORKTREE_NOTE`): serving a linked worktree from the
+/// main index is the intended #302 behavior, and an agent setup that spawns
+/// worktrees under `.claude/worktrees/` sees the note on every read call. Read
+/// at the emit entry points, never in [`served_by_other_checkout`] or
+/// [`cross_checkout_note_for_db`], so the classification a caller keys its own
+/// note suppression to stays a pure predicate. Follows the crate's existing
+/// `TRAVSR_NO_RERANK` / `TRAVSR_ABSTAIN_GUESSES` convention.
+///
+/// Silences the print only. It never turns a cross-checkout answer back into an
+/// ordinary one: the freshness and drift notes stay suppressed, because they
+/// are wrong here whether or not the user wants to read about it. The note
+/// names this variable so the people it is aimed at can find it.
+pub(crate) fn worktree_note_suppressed() -> bool {
+    std::env::var_os("TRAVSR_NO_WORKTREE_NOTE").is_some()
+}
+
 /// Find the deepest registered repo root that is an ancestor of (or equal to)
 /// `start`. Registry values are `<root>/.travsr/graph.db` paths.
 fn registered_ancestor(start: &Path) -> Option<PathBuf> {
@@ -280,6 +438,242 @@ mod tests {
         assert_eq!(
             write_sub.canonicalize().unwrap(),
             wt.canonicalize().unwrap()
+        );
+    }
+
+    /// `same_directory` must answer about directories, not spellings: a path
+    /// that walks through `sub/..` is the same directory as its parent, and two
+    /// genuinely distinct directories are not. The `..` case is the portable
+    /// stand-in for the platform spellings this guards against on Windows
+    /// (forward slashes out of `git rev-parse`, case differences, 8.3 short
+    /// names, UNC shares), which cannot be constructed on a POSIX test runner.
+    #[test]
+    fn same_directory_compares_directories_not_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(same_directory(tmp.path(), &sub.join("..")));
+
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!same_directory(&sub, &other));
+    }
+
+    /// Fail-safe: an unresolvable path counts as the same directory, so a
+    /// cross-checkout claim is never made on the strength of a path this
+    /// process could not resolve.
+    #[test]
+    fn same_directory_treats_unresolvable_paths_as_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(same_directory(
+            tmp.path(),
+            &tmp.path().join("does-not-exist")
+        ));
+    }
+
+    /// The core acceptance, built without invoking git: a linked worktree's
+    /// `.git` is a *file* holding `gitdir: <path>`, and that shape alone is what
+    /// distinguishes the redirect from a normal repo. Constructing it by hand
+    /// keeps the classification independent of a git binary and of the
+    /// platform's worktree bookkeeping.
+    #[test]
+    fn hand_built_gitlink_served_by_another_root_is_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        // The pointer file git writes into a linked worktree. Its payload is a
+        // platform-native absolute path, so it is built from the real `main`
+        // path rather than a hand-spelled string.
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+
+        let here = worktree_served_elsewhere(&wt, &main).expect("must flag the redirect");
+        assert!(
+            same_directory(&here, &wt),
+            "must report the worktree it is standing in"
+        );
+
+        let note = cross_checkout_note(&here, &main, Some("abc1234"), false);
+        assert!(note.contains(&wt.display().to_string()), "got: {note}");
+        assert!(note.contains(&main.display().to_string()), "got: {note}");
+        assert!(note.contains("abc1234"), "got: {note}");
+        assert!(
+            note.contains("not index staleness"),
+            "the note must not be mistaken for the staleness warning it replaces: {note}"
+        );
+        // The hatch is reachable only from the note: it is in no `--help` and no
+        // doc, so the people seeing this on every read call have nowhere else to
+        // find it.
+        assert!(note.contains("TRAVSR_NO_WORKTREE_NOTE=1"), "got: {note}");
+    }
+
+    /// A linked worktree answered from its own root is not a cross-checkout
+    /// answer, even though `.git` is still a gitlink file. Guards the
+    /// `PreferLocalElseMain` case where the worktree was `travsr init`-ed in
+    /// place (issue #586) against a spurious note.
+    #[test]
+    fn gitlink_served_by_its_own_root_is_not_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent/.git/worktrees/wt\n").unwrap();
+        assert!(worktree_served_elsewhere(&wt, &wt).is_none());
+    }
+
+    /// A standard repo (`.git` is a directory) never produces the note, even
+    /// when it is served from somewhere else entirely (an explicit `--db`, or a
+    /// registry-resolved root). Those are the user's own instruction, not the
+    /// worktree redirect this note describes.
+    #[test]
+    fn standard_repo_is_never_reported_as_cross_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        assert!(worktree_served_elsewhere(&repo, &elsewhere).is_none());
+    }
+
+    /// The commit clause is omitted entirely when the index's commit is
+    /// unknown or blank, rather than rendered as an empty parenthetical.
+    #[test]
+    fn cross_checkout_note_omits_an_unknown_commit() {
+        let here = Path::new("/here");
+        let served = Path::new("/there");
+        assert!(!cross_checkout_note(here, served, None, false).contains("indexed at commit"));
+        assert!(!cross_checkout_note(here, served, Some("  "), false).contains("indexed at commit"));
+    }
+
+    /// Serializes the tests that mutate `TRAVSR_NO_WORKTREE_NOTE`, since env is
+    /// process-global and the suite runs in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds [`ENV_LOCK`] and restores `TRAVSR_NO_WORKTREE_NOTE` on drop.
+    ///
+    /// Both halves matter only on a red run, which is the run whose output has
+    /// to be readable. Without the restore, a failing assert leaves the var set
+    /// for every later test in the process; without `into_inner`, the panic that
+    /// caused it also poisons the mutex, so the next test to take the lock dies
+    /// on the poison and reports as a second, unrelated failure that buries the
+    /// first. There is no state behind this lock to be corrupted, so ignoring
+    /// the poison is sound.
+    struct EnvGuard {
+        // Held for its `Drop`, never read.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            Self {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("TRAVSR_NO_WORKTREE_NOTE");
+        }
+    }
+
+    /// End-to-end over the production predicate against a **real** `git
+    /// worktree` (not a hand-built pointer file): exercises both the gitlink
+    /// shape git actually writes and the `<root>/.travsr/graph.db ->
+    /// parent().parent()` derivation that only the public entry does. `cwd` is a
+    /// parameter, so this needs neither a chdir nor a git-served cwd.
+    #[test]
+    fn served_by_other_checkout_flags_a_real_worktree() {
+        let Some((_tmp, main, wt)) = main_and_worktree() else {
+            return;
+        };
+        let db = main.join(".travsr").join("graph.db");
+
+        // Standing in the worktree, served by the main index -> cross-checkout.
+        let here = served_by_other_checkout(&wt, &db).expect("worktree served by main");
+        assert!(same_directory(&here, &wt));
+
+        // From a subdirectory of the worktree, same answer.
+        let wt_sub = wt.join("sub");
+        std::fs::create_dir(&wt_sub).unwrap();
+        assert!(served_by_other_checkout(&wt_sub, &db).is_some());
+
+        // Standing in the main checkout itself, no redirect -> no note.
+        assert!(served_by_other_checkout(&main, &db).is_none());
+    }
+
+    /// `cross_checkout_note_for_db` (the `travsr status` entry) names both roots
+    /// for a real worktree and stays silent in the main checkout. Takes no env
+    /// lock: this entry is pure classification and no longer reads
+    /// `TRAVSR_NO_WORKTREE_NOTE`.
+    #[test]
+    fn cross_checkout_note_for_db_names_the_worktree() {
+        let Some((_tmp, main, wt)) = main_and_worktree() else {
+            return;
+        };
+        let db = main.join(".travsr").join("graph.db");
+
+        let note = cross_checkout_note_for_db(&wt, &db, Some("abc1234"))
+            .expect("worktree served by main must produce a note");
+        assert!(note.contains(&wt.display().to_string()), "got: {note}");
+        assert!(note.contains(&main.display().to_string()), "got: {note}");
+
+        assert!(cross_checkout_note_for_db(&main, &db, Some("abc1234")).is_none());
+    }
+
+    /// The degraded caveat (finding #1) rides inside the single note: the
+    /// `false` variant never claims empty results are unauthoritative, the
+    /// `true` variant does, and neither carries the "wait / run `travsr status`"
+    /// advice from the freshness note it replaces.
+    #[test]
+    fn cross_checkout_note_folds_in_a_degraded_served_index() {
+        let here = Path::new("/wt");
+        let served = Path::new("/main");
+        let clean = cross_checkout_note(here, served, Some("abc1234"), false);
+        assert!(!clean.contains("not authoritative"), "got: {clean}");
+
+        let degraded = cross_checkout_note(here, served, Some("abc1234"), true);
+        assert!(degraded.contains("not authoritative"), "got: {degraded}");
+        assert!(degraded.contains("also incomplete"), "got: {degraded}");
+        assert!(
+            !degraded.contains("travsr status") && !degraded.contains("has not caught up"),
+            "the degraded caveat must not resurrect the freshness advice: {degraded}"
+        );
+    }
+
+    /// `TRAVSR_NO_WORKTREE_NOTE` silences the *print*, and must not also erase
+    /// the *classification*.
+    ///
+    /// The two are what a caller keys two different decisions to: whether to
+    /// print this note, and whether the freshness and drift notes it replaces
+    /// still apply. Folding the hatch into the classifier made muting one
+    /// accurate note hand the user back two misleading ones, so this pins that
+    /// `cross_checkout_note_for_db` keeps answering "yes, another checkout"
+    /// regardless of the variable, and that the variable is visible on its own
+    /// through [`worktree_note_suppressed`] for the emitter to act on.
+    #[test]
+    fn worktree_note_hatch_is_separate_from_the_classification() {
+        let _guard = EnvGuard::acquire();
+        let Some((_tmp, main, wt)) = main_and_worktree() else {
+            return;
+        };
+        let db = main.join(".travsr").join("graph.db");
+
+        std::env::remove_var("TRAVSR_NO_WORKTREE_NOTE");
+        assert!(!worktree_note_suppressed());
+        assert!(cross_checkout_note_for_db(&wt, &db, Some("abc1234")).is_some());
+
+        std::env::set_var("TRAVSR_NO_WORKTREE_NOTE", "1");
+        assert!(worktree_note_suppressed());
+        assert!(
+            cross_checkout_note_for_db(&wt, &db, Some("abc1234")).is_some(),
+            "the hatch must silence the note, not reclassify the answer as \
+             belonging to this tree"
         );
     }
 

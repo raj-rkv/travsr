@@ -65,7 +65,7 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
         anyhow::bail!("not initialized; run `travsr init`");
     }
 
-    daemon_client::warn_if_call_graph_degraded(&db_path);
+    let cross_checkout = daemon_client::warn_if_call_graph_degraded(&db_path);
     let store = daemon_client::open_read_store(&db_path)?;
 
     match format {
@@ -108,12 +108,20 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
     // confident `path:line` list on a drifted worktree is never taken at face
     // value. cwd-local classifier, identical wording to `travsr status` and the
     // MCP tools (`travsr_mcp::head_index_mismatch_note`).
-    if let Some(head) = head.as_deref() {
-        let stored = store
-            .get_meta("last_commit")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+    //
+    // Skipped when this is a linked worktree served by another checkout:
+    // `warn_if_call_graph_degraded` above already named both roots definitively,
+    // and this note would follow it with a guess ("expected in a linked
+    // worktree; otherwise ... wait for the daemon to reconcile") whose advice is
+    // wrong in exactly that case. Keyed to `cross_checkout`, the bool that call
+    // returned, so the suppression tracks the note that was actually emitted
+    // rather than a fresh re-evaluation of the same predicate.
+    let stored = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Some(head) = head.as_deref().filter(|_| !cross_checkout) {
         if let Some(note) = travsr_mcp::head_index_mismatch_note(head, &stored) {
             eprintln!("{note}");
         }
