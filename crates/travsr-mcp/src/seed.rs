@@ -792,7 +792,7 @@ pub(crate) type DocKnnFn<'a> = &'a dyn Fn(&str, u32) -> Vec<(NodeId, f32)>;
 //
 // `doc_lane_candidates` fetches a larger, unfiltered pool; the caller
 // (`tools::build_docs_section`) reranks it and falls back to `doc_floor`-style
-// cosine filtering when the reranker is unavailable/disabled/over-budget —
+// cosine filtering when the reranker is unavailable/disabled/breaker-open —
 // same fail-open contract as the code lane's `crate::rerank::rerank`.
 
 /// Candidate pool size for doc-lane reranking — the doc-corpus analogue of
@@ -1633,8 +1633,10 @@ fn sort_seeds_post_rerank(seeds: &mut [Seed], weak_floor: f32) {
 ///   `g1_bypass`, also using it to skip rerank inference entirely on bypassed
 ///   queries (RFC-021 F2), since the model's opinion is unused either way.
 /// - **Reranker unavailable (`rerank_score: None`):** model absent, disabled
-///   (`TRAVSR_NO_RERANK`), load failed, panicked, or ran over budget — fall
-///   back to the identical pre-RFC-021 gate. No regression, no partial state.
+///   (`TRAVSR_NO_RERANK`), load failed, panicked, or skipped because the circuit
+///   breaker is open — fall back to the identical pre-RFC-021 gate. No
+///   regression, no partial state. An over-budget call is no longer in this list:
+///   it keeps its scores and only feeds the breaker (see `rerank::rerank`).
 ///
 /// Otherwise the four-arm absolute-floor gate is embeddings-independent by
 /// construction (embeddings remain a candidate *source* into RRF fusion, never
@@ -3482,7 +3484,7 @@ mod tests {
 
     #[test]
     fn ws4_inert_without_a_rerank_score() {
-        // No cross-encoder signal (model absent / g1_bypass skip / over budget) → the
+        // No cross-encoder signal (model absent / g1_bypass skip / breaker-skipped) → the
         // rescue reads no relevance evidence and leaves the verdict untouched.
         assert_eq!(
             anchor_rescued_confidence(Confidence::None, false, None, true, true, 0.15),

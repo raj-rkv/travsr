@@ -2,9 +2,11 @@
 //!
 //! Everything here degrades to `None` ("no opinion") rather than propagating
 //! an error: a missing model, a load failure, an inference panic, or a
-//! slow pass must never crash the daemon or block a query — the caller
+//! breaker-open skip must never crash the daemon or block a query — the caller
 //! (`seed::build_seed_set`) treats `None` as "leave ordering/confidence
-//! untouched", which is what makes Phase 2 safe to ship dark.
+//! untouched", which is what makes Phase 2 safe to ship dark. A slow pass that
+//! actually completes keeps its scores and only feeds [`Breaker`]; it is the
+//! *next* calls that skip, never the one that was measured.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -33,24 +35,31 @@ pub(crate) fn rerank_topk() -> usize {
         .unwrap_or(30)
 }
 
-/// Circuit-breaker budget. Mirrors `knn_budget_ms` (tools.rs): measured
-/// *after* the call completes and the result discarded if over budget, rather
-/// than a preemptive timeout — a CPU-bound forward pass can't be safely
-/// aborted mid-flight without unsafe thread termination, and this is the same
-/// tradeoff the existing KNN breaker already makes.
+/// Per-call latency budget. A CPU-bound forward pass can't be safely aborted
+/// mid-flight without unsafe thread termination, so this is necessarily
+/// measured *after* the call completes — which means it can never make the
+/// call that exceeded it any cheaper. It therefore drives [`Breaker`], which
+/// skips inference on *subsequent* calls, and never invalidates the scores of
+/// the call it measured.
 ///
-/// Default 1200 — this is a backstop, not the primary defense against repo
-/// size. The primary defense is `travsr-rerank::MAX_CANDIDATE_CHARS`, which
-/// bounds each candidate's tokenizer input so real cost stays roughly
-/// repo-agnostic (RFC-021 Phase 3 E2E, 2026-07-18): before that fix, K=30 on
-/// kubernetes/kubernetes measured 2.5-9s (vs ~353ms on travsr's own compact
-/// Rust fns) because 40-line Go snippets routinely blew past the tokenizer's
-/// truncation ceiling, and `PaddingStrategy::BatchLongest` then padded every
-/// candidate in a batch up to the longest one. After the input-size fix,
-/// the same K=30 on k8s measured 700-950ms — much closer to travsr's own
-/// number, but a real repo/hardware can still occasionally exceed 600ms
-/// (measured: 7/27 queries), so 1200 keeps headroom over the current
-/// post-fix worst case without going back to tolerating unbounded cost.
+/// Read as a UX policy, not a hardware calibration: "a single interactive
+/// rerank may take up to this long". That reading is what makes one number
+/// portable across an M-series laptop, an OCI A1 core and a Windows CI box —
+/// the alternative (a number predicting how fast the model runs) is wrong on
+/// every machine but the one it was measured on. A slow machine trips the
+/// breaker and stops paying the cost; a fast one never trips it.
+///
+/// Default 1200, unchanged since RFC-021 Phase 3 E2E (2026-07-18), and still a
+/// backstop rather than the primary defense against repo size. The primary
+/// defense is `travsr-rerank::MAX_CANDIDATE_CHARS`, which bounds each
+/// candidate's tokenizer input so real cost stays roughly repo-agnostic:
+/// before that fix, K=30 on kubernetes/kubernetes measured 2.5-9s (vs ~353ms
+/// on travsr's own compact Rust fns) because 40-line Go snippets routinely
+/// blew past the tokenizer's truncation ceiling, and
+/// `PaddingStrategy::BatchLongest` then padded every candidate in a batch up
+/// to the longest one. After the input-size fix, the same K=30 on k8s measured
+/// 700-950ms, and both candidate pools are hard-capped (30 code lane, 20 doc
+/// lane), so per-call cost no longer scales with the repo.
 fn rerank_budget_ms() -> u128 {
     std::env::var("TRAVSR_RERANK_BUDGET_MS")
         .ok()
@@ -58,6 +67,269 @@ fn rerank_budget_ms() -> u128 {
         .filter(|&x: &u128| x > 0)
         .unwrap_or(1200)
 }
+
+/// Default for [`BreakerLimits::trip`]: over-budget calls within
+/// [`BreakerLimits::window`] recent completed calls that open [`Breaker`]. More
+/// than one, because a single slow call is almost always contention from
+/// unrelated work on the developer's machine (a build, a test run) rather than
+/// a statement about the hardware — measured on this repo:
+/// rerank costs 91-671ms per call on an idle 8-core M3 and 1505-3319ms with the
+/// CPU saturated by concurrent builds. Reacting to one sample would disable the
+/// reranker every time the user compiles something.
+const BREAKER_TRIP_COUNT: u32 = 3;
+
+/// Override for [`BREAKER_TRIP_COUNT`]. Clamped to the effective window: a trip
+/// count above the window can never be reached, which would silently disable
+/// the breaker.
+const BREAKER_TRIP_ENV: &str = "TRAVSR_RERANK_BREAKER_TRIP";
+
+/// Override for [`BREAKER_WINDOW`]. Rejected outside `1..=BREAKER_WINDOW_MAX`.
+const BREAKER_WINDOW_ENV: &str = "TRAVSR_RERANK_BREAKER_WINDOW";
+
+/// Default for [`BreakerLimits::window`]: how many recent completed calls the
+/// trip count is measured over. A *window*, not a strict consecutive streak,
+/// because every `get_context` reranks two lanes against one budget — the
+/// heavier code lane (30 candidates, `seed.rs`) then the lighter doc lane (20,
+/// `tools.rs`) — through one shared
+/// [`BREAKER`]. On a machine where only the code lane runs over budget the
+/// per-query sequence is `over, under`, so a consecutive-streak counter that
+/// any in-budget call reset would never open, even though the reranker is over
+/// budget on every single query. `BREAKER_TRIP_COUNT` of the last
+/// `BREAKER_WINDOW` calls trips on that pattern while still ignoring an isolated
+/// spike from a background build (at most two of the window). A window is more
+/// trigger-happy than a streak by construction: at a 5% rate of isolated slow
+/// calls about 1% of calls lose reranking, rising to ~6% at 10% and ~17% at
+/// 15%, by which point the machine is struggling for real. Kept at or below
+/// [`BREAKER_WINDOW_MAX`] so the window fits one atomic word.
+const BREAKER_WINDOW: u32 = 5;
+
+/// Hard ceiling on the window, because the window lives in one `u32` and the
+/// mask is `(1 << window) - 1`. At 32 that shift overflows: debug builds panic,
+/// and release builds compute a mask of `0`, which makes `is_open` permanently
+/// false and silently deletes the breaker. A rejected override is far better
+/// than either, so [`BreakerLimits::from_env`] refuses anything above this.
+const BREAKER_WINDOW_MAX: u32 = 31;
+
+/// The two trip parameters, resolved together because they constrain each
+/// other. Overridable so the trip policy can be reproduced and calibrated on a
+/// shipped binary: it has a *shape* now ("N of the last M") rather than a single
+/// number, the sensible values are machine-dependent, and this crate's own
+/// measurements are from one machine. Without these, checking a claim about the
+/// policy or trading latency protection for keeping RFC-021 on would mean a
+/// custom build, or faking `TRAVSR_RERANK_BUDGET_MS`, which also moves the thing
+/// being measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BreakerLimits {
+    /// Over-budget calls within `window` that open the breaker.
+    trip: u32,
+    /// How many recent completed calls `trip` is measured over.
+    window: u32,
+}
+
+impl BreakerLimits {
+    /// Low-bit mask selecting the `window` most recent calls out of
+    /// [`Breaker::recent_over_budget`].
+    fn mask(self) -> u32 {
+        // `window <= BREAKER_WINDOW_MAX` (31) is enforced on construction, so
+        // this shift cannot overflow.
+        (1u32 << self.window) - 1
+    }
+
+    /// Resolve both from the environment, falling back to the defaults. Any
+    /// unparseable or out-of-range value is ignored rather than rejected loudly:
+    /// this is a diagnostic knob, and a typo in it must not take the reranker
+    /// down a path the defaults would not have taken.
+    fn from_env() -> Self {
+        Self::resolve(
+            std::env::var(BREAKER_WINDOW_ENV).ok().as_deref(),
+            std::env::var(BREAKER_TRIP_ENV).ok().as_deref(),
+        )
+    }
+
+    /// The parsing and clamping rules, taking the raw strings so they are
+    /// unit-testable without mutating process-global environment or pinning the
+    /// `OnceLock` that caches the resolved value.
+    fn resolve(window_raw: Option<&str>, trip_raw: Option<&str>) -> Self {
+        let window = window_raw
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&w| w > 0 && w <= BREAKER_WINDOW_MAX)
+            .unwrap_or(BREAKER_WINDOW);
+        // Clamped to the window in both directions, the default included: with a
+        // window of 2, a trip of 3 (the default) could never be reached and the
+        // breaker would never open at all.
+        let trip = trip_raw
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&t| t > 0)
+            .unwrap_or(BREAKER_TRIP_COUNT)
+            .min(window);
+        Self { trip, window }
+    }
+}
+
+/// While the breaker is open, one call in this many is let through as a probe,
+/// so a machine that was merely busy gets the reranker back without restarting
+/// the daemon. Deliberately counted in calls rather than wall-clock time: no
+/// clock source to disagree about across platforms, and it costs at most one
+/// slow query per interval.
+const BREAKER_PROBE_INTERVAL: u32 = 16;
+
+/// A real circuit breaker for the reranker: it opens once [`BreakerLimits::trip`]
+/// of the last [`BreakerLimits::window`] completed calls ran over budget and
+/// then *skips* inference, which is the only point at which skipping saves
+/// anything.
+///
+/// It deliberately does NOT judge the scores of a call that already ran. The
+/// cross-encoder is deterministic (`travsr-rerank`: same input, identical
+/// output), so how long a call took carries no information about whether its
+/// scores are good — discarding them spent the latency and threw away the
+/// ranking, which is strictly worse than either running or not running.
+///
+/// Owns its counters, and can be handed its trip policy up front
+/// ([`Breaker::with_limits`]), so the decision logic is unit-testable without
+/// reading process-global state or hitting the `OnceLock` pinning caveat that
+/// applies to [`RERANKER`]. The [`BREAKER`] static resolves that policy from the
+/// environment on first use instead.
+struct Breaker {
+    /// Sliding window over recent completed calls: bit *i* (from the LSB) is
+    /// whether the *i*-th most recent call was over budget, keeping only the low
+    /// [`BreakerLimits::window`] bits. Bounded by construction, so it cannot
+    /// overflow however long the process runs. The breaker is open when at least
+    /// [`BreakerLimits::trip`] of those bits are set.
+    recent_over_budget: std::sync::atomic::AtomicU32,
+    /// Calls skipped since the last probe; drives [`BREAKER_PROBE_INTERVAL`].
+    skipped_since_probe: std::sync::atomic::AtomicU32,
+    /// Trip policy, resolved from the environment on first use. A `OnceLock`
+    /// rather than a resolve-per-call so `is_open` and `record` cannot disagree
+    /// about the mask within one call, and so [`new`](Self::new) stays `const`
+    /// and can build the [`BREAKER`] static.
+    limits: OnceLock<BreakerLimits>,
+}
+
+impl Breaker {
+    const fn new() -> Self {
+        Self {
+            recent_over_budget: std::sync::atomic::AtomicU32::new(0),
+            skipped_since_probe: std::sync::atomic::AtomicU32::new(0),
+            limits: OnceLock::new(),
+        }
+    }
+
+    /// A breaker with its trip policy fixed up front, so the decision logic can
+    /// be unit-tested at any policy without touching process-global env or
+    /// pinning the shared `OnceLock`.
+    #[cfg(test)]
+    fn with_limits(trip: u32, window: u32) -> Self {
+        let breaker = Self::new();
+        let _ = breaker.limits.set(BreakerLimits { trip, window });
+        breaker
+    }
+
+    fn limits(&self) -> BreakerLimits {
+        *self.limits.get_or_init(BreakerLimits::from_env)
+    }
+
+    /// Open when at least [`BreakerLimits::trip`] of the last
+    /// [`BreakerLimits::window`] completed calls were over budget.
+    fn is_open(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limits = self.limits();
+        (self.recent_over_budget.load(Relaxed) & limits.mask()).count_ones() >= limits.trip
+    }
+
+    /// `true` when this call should skip inference entirely and fail open to
+    /// the lexical gate. Lets one call in [`BREAKER_PROBE_INTERVAL`] through
+    /// while open so the breaker can close again on its own.
+    fn should_skip(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.is_open() {
+            return false;
+        }
+        if self.skipped_since_probe.fetch_add(1, Relaxed) + 1 >= BREAKER_PROBE_INTERVAL {
+            self.skipped_since_probe.store(0, Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Record a completed call. Only calls that actually ran reach here: a
+    /// skipped call never runs, and the error/panic arms of [`rerank`] return
+    /// before recording, so a model that fails fast or blows up (a different
+    /// failure mode from a slow one) does not feed the window. Logs only on the
+    /// open/close transitions, so a sustained slow machine warns once rather
+    /// than once per query.
+    fn record(&self, over_budget: bool, elapsed_ms: u128, budget_ms: u128) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // An in-budget call reaching here while the breaker is open is usually a
+        // probe, and one probe back within budget means the machine has
+        // recovered, so close immediately rather than ageing the window out one
+        // probe at a time (three probes at `BREAKER_PROBE_INTERVAL` apiece is a
+        // far worse recovery for a machine that was merely busy).
+        //
+        // "Usually", not "only". Two other kinds of call land here, and the
+        // close is taken for them too:
+        //
+        //   * a call that passed `should_skip` while the breaker was still
+        //     closed and was overtaken mid-flight by other threads opening it.
+        //     Only possible concurrently, which is also the only place the
+        //     breaker opens at all: none observed at 1-2 in-flight queries,
+        //     tens per 8000 calls at 4-8.
+        //   * a genuine probe that landed on the doc lane rather than the code
+        //     lane that is actually slow. Both lanes are conditional (`seed.rs`
+        //     gates the code lane on non-empty seeds, `tools.rs` returns early
+        //     with no doc candidates), so a probe's lane is not fixed, and a
+        //     doc-lane probe is in budget by construction and says nothing
+        //     about the code lane.
+        //
+        // Both make the breaker more forgiving than the probe interval alone
+        // suggests: measurably more over-budget calls get through than a
+        // single-threaded reading predicts. That is the fail-open direction, and
+        // it is the price of one shared breaker across two lanes (see
+        // [`BREAKER`]) rather than a defect in this branch.
+        if !over_budget && self.is_open() {
+            self.recent_over_budget.store(0, Relaxed);
+            self.skipped_since_probe.store(0, Relaxed);
+            tracing::info!(elapsed_ms, "rerank back within budget, resuming");
+            return;
+        }
+        let bit = u32::from(over_budget);
+        // Read once for the whole call so the mask that shifts the window and
+        // the trip count that reads it cannot come from different policies.
+        let limits = self.limits();
+        let mask = limits.mask();
+        // The closure never returns `None`, so `fetch_update` always yields the
+        // previous window; the `else` is unreachable but keeps this panic-free.
+        let Ok(prev) = self
+            .recent_over_budget
+            .fetch_update(Relaxed, Relaxed, |w| Some(((w << 1) | bit) & mask))
+        else {
+            return;
+        };
+        let now = ((prev << 1) | bit) & mask;
+        // Exactly one warn per opening, and `fetch_update` is what makes that
+        // true under concurrency: it is a CAS loop, so the window's values are
+        // linearized and each recorder's `prev` is the true predecessor of its
+        // own `now`. A second warn would need a `prev` below the trip count that
+        // is also some earlier recorder's at-or-above-trip `now`, which cannot
+        // both hold. Verified exhaustively over every window state and by
+        // stressing concurrent recorders.
+        if now.count_ones() >= limits.trip && prev.count_ones() < limits.trip {
+            tracing::warn!(
+                elapsed_ms,
+                threshold_ms = budget_ms,
+                trip_count = limits.trip,
+                window = limits.window,
+                "rerank is consistently over budget on this machine, skipping inference \
+                 on further queries and falling back to the lexical gate; it is retried \
+                 periodically"
+            );
+        }
+    }
+}
+
+/// Process-wide breaker. Shared by both call sites (code lane in `seed.rs`,
+/// doc lane in `tools.rs`) on purpose: what it measures is this machine's
+/// capacity to run the model interactively, not a property of either lane.
+static BREAKER: Breaker = Breaker::new();
 
 /// The canonical per-user install location for the reranker model, mirroring
 /// the embed backends' `~/.travsr/models/<id>` layout (see `embed.rs`). P5 ships
@@ -416,14 +688,29 @@ pub(crate) fn warm_background() {
 }
 
 /// Score `candidates` against `query`. Returns `None` — "no opinion" — when
-/// the reranker is absent, disabled, panicked, errored, or ran over budget;
-/// the caller must leave ordering/confidence untouched in that case. Never
-/// panics itself. `Some(scores)` is always the same length as `candidates`,
-/// aligned by index.
+/// the reranker is absent, disabled, panicked, errored, or skipped because the
+/// circuit breaker is open; the caller must leave ordering/confidence untouched
+/// in that case. Never panics itself. `Some(scores)` is always the same length
+/// as `candidates`, aligned by index.
+///
+/// Scores that were actually computed are always returned. An over-budget call
+/// feeds [`BREAKER`] so the *next* queries can skip the cost, but its own
+/// output is kept: the model is deterministic, so elapsed time says nothing
+/// about score quality, and discarding it paid the full latency and then
+/// silently reinstated the confident-salad bug RFC-021 exists to cut.
+///
+/// [`BREAKER`] is a process-global static, so in practice it only opens in a
+/// long-lived MCP or daemon process. The one-shot `travsr ask` CLI path runs
+/// at most two rerank calls per process (code lane, doc lane) and starts fresh
+/// every invocation, so it never accumulates enough over-budget calls to open —
+/// the score-keeping half above is what helps that path.
 pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
     let reranker = reranker()?;
     if candidates.is_empty() {
         return Some(Vec::new());
+    }
+    if BREAKER.should_skip() {
+        return None;
     }
 
     let start = Instant::now();
@@ -443,14 +730,18 @@ pub(crate) fn rerank(query: &str, candidates: &[&str]) -> Option<Vec<f32>> {
     };
 
     let budget = rerank_budget_ms();
-    if elapsed_ms > budget {
-        tracing::warn!(
-            elapsed_ms,
-            threshold_ms = budget,
-            "rerank exceeded circuit-breaker threshold, discarding scores, falling back to lexical gate"
-        );
-        return None;
-    }
+    let over_budget = elapsed_ms > budget;
+    // Per-call timing at a level nobody sees by default. This is the only place
+    // "how close to the budget is this machine" is observable now that `record`
+    // logs only the open/close transitions; force it on for a run with
+    // `RUST_LOG=travsr_mcp::rerank=debug`.
+    tracing::debug!(
+        elapsed_ms,
+        over_budget,
+        budget_ms = budget,
+        "rerank complete"
+    );
+    BREAKER.record(over_budget, elapsed_ms, budget);
     Some(scores)
 }
 
@@ -473,6 +764,253 @@ mod tests {
     fn rerank_budget_default_is_1200ms() {
         std::env::remove_var("TRAVSR_RERANK_BUDGET_MS");
         assert_eq!(rerank_budget_ms(), 1200);
+    }
+
+    #[test]
+    fn breaker_stays_closed_for_isolated_slow_calls() {
+        // A single slow call is contention from unrelated work, not a verdict
+        // on the machine: it must stay a minority of the window, so the reranker
+        // keeps running. (Contrast `breaker_opens_when_one_lane_is_consistently_
+        // over_budget`, where a slow call recurs every query.)
+        let breaker = Breaker::with_limits(BREAKER_TRIP_COUNT, BREAKER_WINDOW);
+        for _ in 0..10 {
+            assert!(!breaker.should_skip());
+            breaker.record(true, 5_000, 1_200);
+            assert!(!breaker.should_skip(), "one slow call must not open it");
+            // Let it age fully out of the window before the next isolated spike.
+            for _ in 0..BREAKER_WINDOW {
+                breaker.record(false, 300, 1_200);
+            }
+        }
+    }
+
+    #[test]
+    fn breaker_opens_when_one_lane_is_consistently_over_budget() {
+        // Every get_context reranks two lanes against one budget through the one
+        // shared breaker: the heavier code lane, then the lighter doc lane. On a
+        // machine where only the code lane runs over budget the per-query
+        // sequence is (over, under). A consecutive-streak counter that any
+        // in-budget call reset would never open here (the doc lane resets it
+        // every query); the windowed trip count must, because the reranker is
+        // over budget on every query. This models the real call path: a skipped
+        // call never records.
+        let breaker = Breaker::with_limits(BREAKER_TRIP_COUNT, BREAKER_WINDOW);
+        let call = |over_budget: bool| {
+            if breaker.should_skip() {
+                return;
+            }
+            let elapsed = if over_budget { 5_000 } else { 300 };
+            breaker.record(over_budget, elapsed, 1_200);
+        };
+        let mut opened = false;
+        for _ in 0..10 {
+            call(true); // code lane, over budget
+            call(false); // doc lane, under budget
+            if breaker.should_skip() {
+                opened = true;
+                break;
+            }
+        }
+        assert!(
+            opened,
+            "the breaker must open when a lane is over budget every query"
+        );
+    }
+
+    #[test]
+    fn breaker_opens_only_after_the_trip_count_then_skips_inference() {
+        let breaker = Breaker::with_limits(BREAKER_TRIP_COUNT, BREAKER_WINDOW);
+        for _ in 0..BREAKER_TRIP_COUNT - 1 {
+            assert!(
+                !breaker.should_skip(),
+                "must not open before the trip count"
+            );
+            breaker.record(true, 5_000, 1_200);
+        }
+        assert!(!breaker.should_skip());
+        breaker.record(true, 5_000, 1_200);
+        // Open: the cost is now skipped rather than paid and discarded.
+        assert!(breaker.should_skip());
+    }
+
+    #[test]
+    fn open_breaker_probes_and_closes_once_calls_are_back_in_budget() {
+        let breaker = Breaker::with_limits(BREAKER_TRIP_COUNT, BREAKER_WINDOW);
+        for _ in 0..BREAKER_TRIP_COUNT {
+            breaker.record(true, 5_000, 1_200);
+        }
+        // Skips until the probe interval elapses, then lets exactly one through.
+        for _ in 0..BREAKER_PROBE_INTERVAL - 1 {
+            assert!(breaker.should_skip());
+        }
+        assert!(!breaker.should_skip(), "one call in N must probe");
+        // The probe came back in budget, so the breaker closes.
+        breaker.record(false, 300, 1_200);
+        assert!(!breaker.should_skip());
+    }
+
+    #[test]
+    fn open_breaker_stays_open_while_probes_are_still_over_budget() {
+        let breaker = Breaker::with_limits(BREAKER_TRIP_COUNT, BREAKER_WINDOW);
+        for _ in 0..BREAKER_TRIP_COUNT {
+            breaker.record(true, 5_000, 1_200);
+        }
+        for _ in 0..BREAKER_PROBE_INTERVAL - 1 {
+            assert!(breaker.should_skip());
+        }
+        assert!(!breaker.should_skip());
+        breaker.record(true, 5_000, 1_200);
+        assert!(breaker.should_skip(), "a slow probe must not close it");
+    }
+
+    /// The window override's sharp edge, which is why it is range-checked at
+    /// all: `BreakerLimits::mask` is `(1 << window) - 1`, so a window of 32 or
+    /// more overflows the shift — a debug build panics and a release build gets
+    /// a mask of 0, which makes `is_open` permanently false and silently deletes
+    /// the breaker. Out-of-range and unparseable values must fall back to the
+    /// default rather than reach `mask` at all.
+    #[test]
+    fn breaker_window_override_rejects_values_that_would_break_the_mask() {
+        let window_of = |raw: Option<&str>| BreakerLimits::resolve(raw, None).window;
+
+        assert_eq!(window_of(None), BREAKER_WINDOW, "unset uses the default");
+        assert_eq!(window_of(Some("8")), 8, "an in-range override applies");
+        assert_eq!(window_of(Some(" 8 ")), 8, "surrounding whitespace is fine");
+        assert_eq!(
+            window_of(Some("31")),
+            BREAKER_WINDOW_MAX,
+            "the ceiling is usable"
+        );
+
+        for rejected in ["32", "64", "4294967295", "0", "-1", "", "banana", "5.5"] {
+            assert_eq!(
+                window_of(Some(rejected)),
+                BREAKER_WINDOW,
+                "{rejected:?} must fall back to the default, not reach the mask"
+            );
+        }
+
+        // The property the range check exists to protect, stated directly.
+        for window in 1..=BREAKER_WINDOW_MAX {
+            let mask = BreakerLimits { trip: 1, window }.mask();
+            assert_eq!(
+                mask.count_ones(),
+                window,
+                "mask must select exactly {window} bits"
+            );
+        }
+    }
+
+    /// A trip count above the window can never be reached, so it would silently
+    /// disable the breaker. Clamping covers the override *and* the default: a
+    /// window of 2 with the default trip of 3 is the same trap arrived at from
+    /// the other side.
+    #[test]
+    fn breaker_trip_override_is_clamped_to_the_window() {
+        let limits = |w: Option<&str>, t: Option<&str>| BreakerLimits::resolve(w, t);
+
+        assert_eq!(
+            limits(None, None),
+            BreakerLimits {
+                trip: BREAKER_TRIP_COUNT,
+                window: BREAKER_WINDOW
+            }
+        );
+        assert_eq!(
+            limits(None, Some("2")).trip,
+            2,
+            "an in-range override applies"
+        );
+        assert_eq!(
+            limits(Some("5"), Some("9")).trip,
+            5,
+            "a trip above the window is clamped to it"
+        );
+        assert_eq!(
+            limits(Some("2"), None).trip,
+            2,
+            "the default is clamped too"
+        );
+        for rejected in ["0", "", "nope"] {
+            assert_eq!(
+                limits(None, Some(rejected)).trip,
+                BREAKER_TRIP_COUNT,
+                "{rejected:?}"
+            );
+        }
+    }
+
+    /// `resolve` is tested above without touching the environment; this is the
+    /// one test that the documented variable *names* are the ones actually read,
+    /// which no amount of `resolve` coverage can catch. Safe to mutate env here:
+    /// `from_env` holds no `OnceLock` of its own, so nothing is pinned by it.
+    ///
+    /// The names are spelled out as literals rather than reused from the
+    /// constants. Setting `BREAKER_WINDOW_ENV` and asserting that
+    /// `BREAKER_WINDOW_ENV` was read passes for any string at all, including a
+    /// typo, which is exactly the failure this test exists to catch.
+    #[test]
+    fn breaker_limits_read_the_documented_env_var_names() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("TRAVSR_RERANK_BREAKER_WINDOW");
+                std::env::remove_var("TRAVSR_RERANK_BREAKER_TRIP");
+            }
+        }
+        let _restore = Restore;
+
+        assert_eq!(BREAKER_WINDOW_ENV, "TRAVSR_RERANK_BREAKER_WINDOW");
+        assert_eq!(BREAKER_TRIP_ENV, "TRAVSR_RERANK_BREAKER_TRIP");
+
+        std::env::remove_var("TRAVSR_RERANK_BREAKER_WINDOW");
+        std::env::remove_var("TRAVSR_RERANK_BREAKER_TRIP");
+        assert_eq!(
+            BreakerLimits::from_env(),
+            BreakerLimits {
+                trip: BREAKER_TRIP_COUNT,
+                window: BREAKER_WINDOW
+            }
+        );
+
+        std::env::set_var("TRAVSR_RERANK_BREAKER_WINDOW", "9");
+        std::env::set_var("TRAVSR_RERANK_BREAKER_TRIP", "4");
+        assert_eq!(
+            BreakerLimits::from_env(),
+            BreakerLimits { trip: 4, window: 9 },
+            "both overrides must be read from the names the docs advertise"
+        );
+    }
+
+    /// The overrides must reach the decision logic, not just parse. Pinning only
+    /// the parser would leave `is_open` and `record` free to keep using the
+    /// defaults while the tests above stayed green.
+    #[test]
+    fn overridden_limits_drive_the_trip_decision() {
+        // Trip at 2 of the last 2: opens strictly sooner than the default 3-of-5.
+        let breaker = Breaker::with_limits(2, 2);
+        breaker.record(true, 5_000, 1_200);
+        assert!(!breaker.should_skip(), "one over-budget call is not two");
+        breaker.record(true, 5_000, 1_200);
+        assert!(breaker.should_skip(), "2 of the last 2 must open it");
+
+        // A wider window with the same trip tolerates the isolated spikes that
+        // the narrow one above trips on.
+        let breaker = Breaker::with_limits(2, 8);
+        for _ in 0..4 {
+            breaker.record(true, 5_000, 1_200);
+            assert!(
+                !breaker.should_skip(),
+                "spikes spread across the window must not trip"
+            );
+            for _ in 0..8 {
+                breaker.record(false, 300, 1_200);
+            }
+        }
     }
 
     #[test]
