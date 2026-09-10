@@ -85,9 +85,14 @@ impl RepoWrite {
 }
 
 /// The exact repo-relative subpaths `language`'s Phase B analyzer must write,
-/// keeping the rest of the repo root read-only. Empty for every language except
-/// scala: `sbt compile` writes build outputs to `target/` and `project/target/`
-/// inside the project (sbt's layout has no out-of-tree build option), and
+/// keeping the rest of the repo root read-only. Empty for every language whose
+/// analyzer writes only outside the repo; non-empty for the ones that drive the
+/// project's own build tool (scala, java, kotlin, csharp) and for php, whose
+/// analyzer hardcodes its output path.
+///
+/// scala: `sbt compile` writes build outputs to `target/` inside the project
+/// (sbt's layout has no out-of-tree build option): at the root, under
+/// `project/`, and once per platform in an sbt-crossproject tree. And
 /// SemanticDB is enabled via a settings file (`.travsr-semanticdb.sbt`) the
 /// wrapper drops alongside `build.sbt`. Narrowing to these subpaths — rather than
 /// the whole repo root — means a hostile `build.sbt` executed by sbt during
@@ -99,17 +104,100 @@ pub fn repo_write_subpaths(language: &str) -> &'static [RepoWrite] {
         "scala" => &[
             RepoWrite::Dir("target"),
             RepoWrite::Dir("project/target"),
+            // sbt's meta-build of the meta-build. Present in a real crossproject
+            // tree and written by the same `sbt compile`.
+            RepoWrite::Dir("project/project/target"),
+            // #832 moved the scala sidecar to sbt-crossproject support on the
+            // read side (`find_semanticdb_files` walks `target/` at any depth,
+            // and its own test asserts `jvm/target` and `native/target`), but
+            // this grant stayed on the single-module layout. A crossproject
+            // build writes SemanticDB per platform: on the pinned
+            // scala-parser-combinators fixture all 150 `.semanticdb` files land
+            // under js/jvm/native and NONE under the granted `target/`. On macOS
+            // scala runs under the `Elevated` policy, which skips sandbox-exec
+            // entirely, so the mismatch is invisible there; on Linux the repo
+            // root is a `--ro-bind` and those writes take EROFS.
+            RepoWrite::Dir("js/target"),
+            RepoWrite::Dir("jvm/target"),
+            RepoWrite::Dir("native/target"),
             RepoWrite::File(".travsr-semanticdb.sbt"),
         ],
+        // scip-php has no `--output`: it hardcodes `index.scip` relative to its
+        // working directory, which has to be the repo for it to find
+        // composer.json at all. Without this grant the sidecar's write is denied
+        // and `file_put_contents` returns false with a zero exit status, i.e. a
+        // silent empty index rather than a reported failure. The sidecar moves
+        // the file into scratch and removes it, so nothing survives the run.
+        "php" => &[RepoWrite::File("index.scip")],
+        // These three drive the project's own build tool, which writes its
+        // output into the project. Same trade scala already makes, same shape
+        // of grant, and without it their Phase B is dead on Linux: the repo root
+        // is a `--ro-bind`, so javac and the compiler plugin take EROFS and the
+        // language indexes to nothing. All three are `RequiresElevated`, which
+        // on macOS skips the sandbox entirely, which is why this was invisible.
+        //
+        // Verified on Linux for java/maven (bwrap, arm64): with `target/` bound
+        // over a read-only root, writing new files, deleting files inside it and
+        // deleting its CONTENTS all succeed, and a write outside the grant is
+        // still denied. Only removing the `target` directory itself fails, and
+        // the java sidecar passes `-Dmaven.clean.failOnError=false` so `clean`
+        // degrades that to a warning: contents are still cleared, javac still
+        // runs, BUILD SUCCESS. Gradle needs no equivalent flag because scip-java
+        // drives it through `scipCompileAll` and never runs `clean`.
+        //
+        // kotlin and csharp were measured the same way, on the same host.
+        // csharp needed nothing beyond `obj/` and `bin/`: `dotnet build` writes
+        // its assembly and succeeds. kotlin needed one directory that guessing
+        // would have missed, and did miss: the Kotlin Gradle Plugin opens a
+        // build session under `<project>/.kotlin/sessions/`, so without it
+        // `compileKotlin` dies with
+        // `FileSystemException: .kotlin/sessions/....salive: Read-only file
+        // system` while every other grant is in place. With it, the same build
+        // compiles. `.kotlin` is deliberately NOT on java's list: a pure java
+        // gradle build never loads that plugin, and a mixed java/kotlin repo
+        // that turns out to need it is one line, added when it is observed
+        // rather than guessed at now.
+        "java" => &[
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+        ],
+        "kotlin" => &[
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+            RepoWrite::Dir(".kotlin"),
+        ],
+        "csharp" => &[RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
         _ => &[],
     }
 }
 
-/// Whether `language`'s analyzer needs any repo-root write grant at all. Derived
-/// from [`repo_write_subpaths`]; the Windows AppContainer path uses this coarse
-/// bool (scala is `WindowsSandbox::Unsupported` there and never reaches it).
-pub fn needs_repo_write(language: &str) -> bool {
-    !repo_write_subpaths(language).is_empty()
+/// Whether any existing component of `root`/`subpath` is a symlink.
+///
+/// Checked component by component, not just at the leaf: a link anywhere on the
+/// path (`target` -> `/`, then `target/x`) escapes the repo just as well. A
+/// component that does not exist yet is fine, since it is created as a real
+/// dir/file immediately after and the result is re-stat'd before it is granted.
+///
+/// Shared by every platform that materialises a repo-write grant: the host
+/// creates the path as the user, UNSANDBOXED, so a repo shipping php's
+/// `index.scip` as a link to `~/.ssh/authorized_keys` would otherwise get that
+/// target created and then handed to the sandbox writable.
+pub fn grant_path_has_symlink(root: &std::path::Path, subpath: &str) -> bool {
+    let mut p = root.to_path_buf();
+    for component in std::path::Path::new(subpath).components() {
+        p.push(component);
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return true;
+                }
+            }
+            // Does not exist yet: nothing to follow.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Compute the toolchain grants for a language's Phase B analyzer.
@@ -1147,6 +1235,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    /// The repo-write grant guard: every platform that materialises a grant
+    /// calls this before creating the path as the user, so a link anywhere on
+    /// it must be refused, not just at the leaf.
+    #[test]
+    fn grant_path_symlink_guard_rejects_a_link_at_any_component() {
+        use super::grant_path_has_symlink;
+        let root = scratch("grantlink");
+
+        // A path that does not exist yet is fine: it gets created as a real
+        // file or directory immediately after, then re-stat'd.
+        assert!(!grant_path_has_symlink(&root, "index.scip"));
+
+        // A real file and a real nested directory are both fine.
+        std::fs::write(root.join("real.scip"), b"").expect("write file");
+        std::fs::create_dir_all(root.join("jvm/target")).expect("create dirs");
+        assert!(!grant_path_has_symlink(&root, "real.scip"));
+        assert!(!grant_path_has_symlink(&root, "jvm/target"));
+
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, b"secret").expect("write outside");
+
+            // Leaf is a link.
+            std::os::unix::fs::symlink(&outside, root.join("linked.scip")).expect("symlink");
+            assert!(grant_path_has_symlink(&root, "linked.scip"));
+
+            // An intermediate component is a link: the leaf below it is a real
+            // directory, so a leaf-only check would pass this.
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("target")).expect("create elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, root.join("js")).expect("symlink dir");
+            assert!(grant_path_has_symlink(&root, "js/target"));
+        }
     }
 
     /// Homebrew layout: `<root>/bin/dotnet` with the SDK under `<root>/libexec`.

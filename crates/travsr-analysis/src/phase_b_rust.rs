@@ -882,18 +882,70 @@ const WRAPPER_CONSTRUCTOR_NAMES: &[&str] = &[
     "Option", "Arc", "Box", "Rc", "RefCell", "Mutex", "RwLock", "Cell", "Weak",
 ];
 
+/// Result/Option adapters that hand back the very value the constructor call
+/// produced, so an initializer wrapped in them carries exactly the evidence
+/// the bare constructor call does. Closed list on purpose: a name outside it
+/// stops the peel in [`peel_result_adapters`] and the initializer falls
+/// through to `None`, which is the safe answer.
+const TRANSPARENT_RESULT_ADAPTERS: &[&str] = &["unwrap", "expect", "context", "with_context"];
+
+/// Peel `?` and the [`TRANSPARENT_RESULT_ADAPTERS`] off a `let` initializer so
+/// `let s = T::open(p).with_context(|| ..)?` reaches the same `T::open(p)`
+/// constructor call that `let s = T::open(p)` already resolves through. Each
+/// step descends into a child node, so the loop always terminates.
+///
+/// Nothing else is peeled: `T::open(p).into_inner()` or `T::builder().build()`
+/// stop here and resolve to `None`, keeping the inference to shapes whose
+/// result type is the constructor's own.
+fn peel_result_adapters<'a>(
+    mut value: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> tree_sitter::Node<'a> {
+    loop {
+        match value.kind() {
+            "try_expression" => match value.named_child(0) {
+                Some(inner) => value = inner,
+                None => return value,
+            },
+            "call_expression" => {
+                let Some(func) = value.child_by_field_name("function") else {
+                    return value;
+                };
+                if func.kind() != "field_expression" {
+                    return value;
+                }
+                let Some(field) = func.child_by_field_name("field") else {
+                    return value;
+                };
+                let Ok(name) = field.utf8_text(source) else {
+                    return value;
+                };
+                if !TRANSPARENT_RESULT_ADAPTERS.contains(&name) {
+                    return value;
+                }
+                match func.child_by_field_name("value") {
+                    Some(recv) => value = recv,
+                    None => return value,
+                }
+            }
+            _ => return value,
+        }
+    }
+}
+
 /// Resolve a `let_declaration`'s bound type per §4.5 bullet 2: prefer an
 /// explicit `type:` annotation; otherwise infer from a capitalized
 /// constructor call (`SqliteStore::open(..)`) or struct literal
-/// (`SqliteStore { .. }`) on the right-hand side. Anything else (a plain
-/// identifier, a method chain, a literal) is `None` — inferring through an
-/// arbitrary expression is exactly the unbounded problem #529 rejected doing
-/// with a denylist; only these two syntactically unambiguous shapes are used.
+/// (`SqliteStore { .. }`) on the right-hand side, after peeling any
+/// `?`/`unwrap`/`expect`/`context` adapters wrapped around it. Anything else
+/// (a plain identifier, an arbitrary method chain, a literal) is `None` —
+/// inferring through an arbitrary expression is exactly the unbounded problem
+/// #529 rejected doing with a denylist; only these shapes are used.
 fn extract_type_from_let(let_decl: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     if let Some(ty) = let_decl.child_by_field_name("type") {
         return extract_receiver_type_name(ty, source);
     }
-    let value = let_decl.child_by_field_name("value")?;
+    let value = peel_result_adapters(let_decl.child_by_field_name("value")?, source);
     match value.kind() {
         "call_expression" => {
             let func = value.child_by_field_name("function")?;
@@ -1279,6 +1331,47 @@ mod tests {
             recv_type_for_call(source, "open"),
             Some("SqliteStore".to_string())
         );
+    }
+
+    #[test]
+    fn t4d_constructor_behind_result_adapters_resolves() {
+        // Real repro (#877 follow-up): `travsr-daemon`'s init_repo_with_progress
+        // binds its store as
+        //   `let mut store = SqliteStore::open(&db_path).with_context(|| ..)?;`
+        // Before the adapter peel this returned None, so every `store.method()`
+        // in that function was emitted with `recv_type: None` and dropped by the
+        // daemon's #604 fail-closed gate, leaving those call edges to the
+        // fail-open rust-analyzer LSIF path alone.
+        let source =
+            b"fn f() { let mut store = SqliteStore::open(&p).with_context(|| x)?; store.begin_staging_tables(); }";
+        assert_eq!(
+            recv_type_for_call(source, "begin_staging_tables"),
+            Some("SqliteStore".to_string())
+        );
+        for src in [
+            &b"fn f() { let s = SqliteStore::open(&p)?; s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).unwrap(); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).expect(\"m\"); s.node_count(); }"[..],
+            &b"fn f() { let s = SqliteStore::open(&p).context(\"m\")?; s.node_count(); }"[..],
+        ] {
+            assert_eq!(
+                recv_type_for_call(src, "node_count"),
+                Some("SqliteStore".to_string()),
+                "adapter-wrapped constructor must resolve: {}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn t4e_non_transparent_adapter_still_resolves_to_none() {
+        // Only adapters that return the constructor's own value are peeled. A
+        // chain that transforms the type (`.build()`, `.to_str()`) carries no
+        // evidence of the binding's type and must stay None.
+        let source = b"fn f() { let s = SqliteStore::builder().build(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source, "node_count"), None);
+        let source2 = b"fn f() { let s = PathBuf::from(&p).to_str().unwrap(); s.node_count(); }";
+        assert_eq!(recv_type_for_call(source2, "node_count"), None);
     }
 
     /// Manual measurement tool for #529 Phase 0 (plan §6.1 R-2/R-3/R-4) — not

@@ -386,12 +386,20 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     ["zero_nodes", lang] => {
                         eprintln!(
-                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help, it usually means the analyzer could not read or build this project's sources (a missing SDK or an unbuildable project). Fix the project setup, then re-run `travsr init --semantic --force`"
+                            // `=warn`, not `=debug`: this PR promoted the
+                            // zero-node stderr echo in `travsr-plugin-host`'s
+                            // transport from `debug!` to `warn!` precisely so
+                            // the cause is reachable without turning on
+                            // everything else, and `observability.rs` tells an
+                            // agent `=warn` for this same condition. Two
+                            // surfaces naming two levels for one problem is how
+                            // the advice starts drifting.
+                            "warning: '{lang}' analysis ran but found no symbols, though the repo has '{lang}' sources. The analyzer is installed, so reinstalling will not help. The cause is in the analyzer's own output: re-run `RUST_LOG=travsr_plugin_host=warn travsr init --semantic --force` to see it. It may be this project (a missing SDK, an unbuildable project, or a build that skips part of its sources), or it may be how travsr invoked the analyzer"
                         );
                         // Name the concrete thing to check rather than leaving
-                        // "a missing SDK or an unbuildable project" as the only
-                        // clue — the catalog already knows what this language's
-                        // analyzer needs from the project.
+                        // the possible causes as the only clue: the catalog
+                        // already knows what this language's analyzer needs
+                        // from the project.
                         if let Some(entry) = travsr_plugin_host::phase_b::catalog::lookup(lang) {
                             let prereq = entry.effective_prerequisites();
                             if !prereq.is_empty() && prereq != "none" {

@@ -550,6 +550,216 @@ fn sandbox_scala_repo_write_is_narrowed_to_build_subpaths() {
     }
 }
 
+// 4c. The repo-write grant set is a signed enumeration (ADR-017 Amendment A6),
+// not a knob. Pinned exactly, so widening it has to be a deliberate test edit:
+// the previous suite asserted only "build.sbt denied, target/ allowed", which
+// would have passed unchanged if a language had been granted the whole root.
+#[test]
+fn repo_write_grants_are_exactly_the_authorised_set() {
+    use travsr_plugin_host::sandbox::toolchain::{repo_write_subpaths, RepoWrite};
+
+    assert_eq!(
+        repo_write_subpaths("scala").to_vec(),
+        vec![
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("project/target"),
+            RepoWrite::Dir("project/project/target"),
+            RepoWrite::Dir("js/target"),
+            RepoWrite::Dir("jvm/target"),
+            RepoWrite::Dir("native/target"),
+            RepoWrite::File(".travsr-semanticdb.sbt"),
+        ],
+        "scala's repo-write grant must match ADR-017 Amendment A6 exactly"
+    );
+    assert_eq!(
+        repo_write_subpaths("php").to_vec(),
+        vec![RepoWrite::File("index.scip")],
+        "php's repo-write grant must be the single output file, never a directory"
+    );
+    // These three drive the project's own build tool, which writes into the
+    // project. Verified on Linux for java/maven: `target/` bound over a
+    // read-only root lets clean clear the contents and javac run, while a write
+    // outside the grant is still denied.
+    assert_eq!(
+        repo_write_subpaths("java").to_vec(),
+        vec![
+            RepoWrite::Dir("target"),
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+        ],
+        "java's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
+    assert_eq!(
+        repo_write_subpaths("kotlin").to_vec(),
+        vec![
+            RepoWrite::Dir("build"),
+            RepoWrite::Dir(".gradle"),
+            // The Kotlin Gradle Plugin's build session dir. Measured: without
+            // it compileKotlin dies on a read-only .kotlin/sessions/ even with
+            // every other grant present.
+            RepoWrite::Dir(".kotlin"),
+        ],
+        "kotlin's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
+    assert_eq!(
+        repo_write_subpaths("csharp").to_vec(),
+        vec![RepoWrite::Dir("obj"), RepoWrite::Dir("bin")],
+        "csharp's repo-write grant must match ADR-017 Amendment A8 exactly"
+    );
+
+    // Everything else keeps a fully read-only repo root.
+    for lang in [
+        "go",
+        "rust",
+        "python",
+        "typescript",
+        "javascript",
+        "ruby",
+        "dart",
+        "swift",
+        "objectivec",
+        "c",
+        "cpp",
+        "",
+    ] {
+        assert!(
+            repo_write_subpaths(lang).is_empty(),
+            "{lang} must not hold any repo-write grant (ADR-017 Rule 1)"
+        );
+    }
+
+    // No grant may name the repo root itself or escape it.
+    for lang in ["scala", "php", "java", "kotlin", "csharp"] {
+        for entry in repo_write_subpaths(lang) {
+            let sub = entry.subpath();
+            assert!(
+                !sub.is_empty(),
+                "{lang}: an empty subpath grants the repo root"
+            );
+            assert!(
+                !sub.starts_with('/') && !sub.split('/').any(|c| c == ".."),
+                "{lang}: grant `{sub}` escapes the repo root"
+            );
+        }
+    }
+}
+
+// 4d. php's grant is one output file, not the repo. A write to any other
+// repo-root path must still be denied; the write to index.scip must succeed.
+#[test]
+#[cfg(target_os = "linux")]
+fn sandbox_php_repo_write_is_narrowed_to_index_scip() {
+    use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    let _env = env_guard();
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let breach_path = repo.path().join("composer.json"); // repo root, not granted
+    let allowed_path = repo.path().join("index.scip");
+
+    let breach = build_sandboxed_command(
+        "sh",
+        &[
+            "-c",
+            &format!("echo hostile > {} 2>&1; true", breach_path.display()),
+        ],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "php",
+    );
+    match breach {
+        Err(SandboxUnavailable(ref msg)) => {
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
+            }
+            eprintln!("SKIP: {msg}");
+            return;
+        }
+        Ok(spawner) => {
+            let _ = spawner.output();
+            assert!(
+                !breach_path.exists()
+                    || std::fs::read_to_string(&breach_path)
+                        .unwrap_or_default()
+                        .trim()
+                        != "hostile",
+                "php sandbox allowed a write to a repo-root file outside index.scip"
+            );
+        }
+    }
+
+    let allowed = build_sandboxed_command(
+        "sh",
+        &["-c", &format!("echo ok > {}", allowed_path.display())],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "php",
+    );
+    if let Ok(spawner) = allowed {
+        let _ = spawner.output();
+        assert_eq!(
+            std::fs::read_to_string(&allowed_path)
+                .unwrap_or_default()
+                .trim(),
+            "ok",
+            "php sandbox blocked the write to index.scip — scip-php has no --output"
+        );
+    }
+}
+
+// 4e. A grant path that is a symlink must never be created or bound. The host
+// creates the grant path UNSANDBOXED as the user, and create/open/`--bind` all
+// follow links, so a repo shipping `index.scip` as a link to a file in the
+// user's home would otherwise get that target created and bound WRITABLE.
+#[test]
+#[cfg(target_os = "linux")]
+fn sandbox_symlinked_repo_write_grant_is_refused() {
+    use travsr_plugin_host::sandbox::linux::build_sandboxed_command;
+    let _env = env_guard();
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside");
+    let scratch = tempfile::tempdir().expect("scratch");
+
+    // Stands in for ~/.ssh/authorized_keys: outside the repo, does not exist.
+    let victim = outside.path().join("authorized_keys");
+    std::os::unix::fs::symlink(&victim, repo.path().join("index.scip")).expect("symlink");
+
+    let cmd = build_sandboxed_command(
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "echo pwned > {}/index.scip 2>/dev/null; true",
+                repo.path().display()
+            ),
+        ],
+        repo.path(),
+        scratch.path(),
+        &SandboxPolicy::Standard,
+        "php",
+    );
+    match cmd {
+        Err(SandboxUnavailable(ref msg)) => {
+            if std::env::var("CI").is_ok() {
+                panic!("sandbox unavailable in CI: {msg}");
+            }
+            eprintln!("SKIP: {msg}");
+            return;
+        }
+        Ok(spawner) => {
+            let _ = spawner.output();
+        }
+    }
+
+    assert!(
+        !victim.exists(),
+        "a symlinked repo-write grant reached outside the repo — the host followed the link"
+    );
+}
+
 // 5. Scratch dir is writable
 #[test]
 #[cfg(target_os = "linux")]

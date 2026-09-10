@@ -101,6 +101,7 @@ impl Plugin for RustPlugin {
         });
 
         InvokeResponse {
+            diagnostics: Vec::new(),
             nodes,
             edges,
             refs,

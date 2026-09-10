@@ -380,9 +380,21 @@ const JAVA_QUERY: &str = r#"
 /// interface distinction is not written in the source at all — both are valid
 /// `is-implementation` targets, so both are emitted and the target-kind gate in
 /// the daemon decides.
+///
+/// Calls need the same generic treatment the base list already got. Per the
+/// grammar's node-types, `invocation_expression.function` can be a `generic_name`
+/// directly and `member_access_expression.name` can be `identifier` OR
+/// `generic_name`, so a plain-`identifier`-only pattern silently never matches
+/// `Bar<T>()` or `x.Foo<T>()`. The generic arms below capture the `identifier`
+/// inside the `generic_name`, which is the bare method name the resolver wants;
+/// it sits two parents under the `member_access_expression`, within
+/// `MEMBER_LOOKUP_DEPTH`, so `x.Foo<T>()` still classifies as a call and not a
+/// field read.
 const CSHARP_QUERY: &str = r#"
 (invocation_expression function: (identifier) @call.name)
+(invocation_expression function: (generic_name (identifier) @call.name))
 (member_access_expression name: (identifier) @sel.name)
+(member_access_expression name: (generic_name (identifier) @sel.name))
 (base_list (identifier) @base.name)
 (base_list (generic_name (identifier) @base.name))
 (base_list (qualified_name name: (identifier) @base.name))
@@ -649,6 +661,21 @@ func (t *T) Foo() {}
         assert_eq!(names(&refs.calls), vec![(3, "Helper"), (4, "Submit")]);
         assert_eq!(names(&refs.fields), vec![(5, "Total")]);
         assert_eq!(bases(&refs.inheritance), vec!["Base", "IRunnable"]);
+    }
+
+    /// `x.Foo<int>()` and `Bar<T>()` are ordinary calls that the plain-identifier
+    /// patterns never saw, because the grammar wraps a generic callee in a
+    /// `generic_name` node. The on-save lane therefore never asked about them.
+    #[test]
+    fn csharp_detects_generic_calls() {
+        let refs = detect_live_refs(
+            Language::CSharp,
+            b"var a = s.Foo<int>(1); var b = Bar<T>(2);",
+        )
+        .unwrap();
+        assert_eq!(names(&refs.calls), vec![(1, "Foo"), (1, "Bar")]);
+        // A generic method call is a call, never a field read.
+        assert_eq!(names(&refs.fields), vec![]);
     }
 
     // ── C / C++ ──────────────────────────────────────────────────────────────

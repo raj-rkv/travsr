@@ -44,6 +44,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     decl_kinds: &[],
     type_refinements: &[],
     post_parse: None,
+    name_hook: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_scala::LANGUAGE),
 };
 
@@ -64,6 +65,27 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let out = parse("corp", &path, "empty.scala").unwrap();
         assert_eq!(out.nodes.len(), 1);
+    }
+
+    #[test]
+    fn expression_bodied_def_span_stops_before_the_next_def() {
+        // tree-sitter-scala keeps an expression-bodied `function_definition`
+        // open across the newline and the next line's indent, so the raw end
+        // row lands on the following declaration. Two adjacent defs then own
+        // the boundary line and caller attribution has to break the tie by
+        // NodeId (#527 fallout). Spans must not overlap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.scala");
+        std::fs::write(&path, "trait T {\n  def a =\n    1\n  def b =\n    2\n}\n").unwrap();
+        let out = parse("corp", &path, "t.scala").unwrap();
+        let mut spans: Vec<(u32, u32)> = out
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "method")
+            .map(|n| (n.line.unwrap_or(0), n.end_line.unwrap_or(0)))
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, vec![(2, 3), (4, 5)]);
     }
 
     #[test]

@@ -6,9 +6,64 @@ use std::sync::{Arc, Mutex};
 use travsr_error::IndexError;
 use travsr_plugin_protocol::{
     codec::{decode_message, write_message},
-    HandshakeRequest, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
-    PluginRequest, PluginResponse, PROTOCOL_VERSION,
+    DiagnosticSeverity, HandshakeRequest, InvokeRequest, InvokeResponse, ParseRequest,
+    ParseResponse, Plugin, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
+
+/// Caps on the `InvokeResponse::diagnostics` the host will echo.
+///
+/// A sidecar is an untrusted peer (RFC-011 section 3), and nothing on the wire
+/// bounds this list or its fields except the 1 GiB frame cap: ~5M records of 200
+/// bytes is a legal response. The host logs every record it accepts, and the
+/// daemon never deletes the log file it is currently writing, so an unbounded
+/// echo is both disk exhaustion and evidence destruction (genuine lines pushed
+/// out of the log read window). The stderr channel these replaced is bounded at
+/// 64 lines; these are bounded here.
+const MAX_DIAGNOSTICS: usize = 32;
+const MAX_DIAGNOSTIC_CODE_BYTES: usize = 256;
+const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
+
+/// Whether `code` has the dotted-identifier shape its wire contract documents
+/// (`java.tests-not-compiled`). Nothing on the wire enforces it, and the host
+/// emits `code` as a tracing FIELD, where an arbitrary value could impersonate a
+/// log key for anything that later selects on it.
+fn is_diagnostic_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_DIAGNOSTIC_CODE_BYTES
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Strip control characters and cut to `limit` bytes on a char boundary.
+///
+/// `tracing-subscriber`'s fmt layer escapes ANSI today, but travsr neither pins
+/// nor tests that, and it does not escape `\n` / `\r` at all: a message with
+/// newlines forges apparent log lines on the plain stderr layer. Owning the
+/// property here makes it one sanitising step rather than a borrowed one.
+fn sanitize_diagnostic(s: &str, limit: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(limit));
+    for ch in s.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if out.len() + ch.len_utf8() > limit {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The sidecar's stderr tail with control characters flattened, ready to log.
+///
+/// The ring hands back up to 64 sidecar-chosen lines verbatim, newlines and all.
+/// `observability` splits the daemon log on newlines and parses each line into a
+/// structured entry, so an unsanitised echo lets a sidecar forge log records
+/// (its own level, target and message) that `get_daemon_logs` then serves to an
+/// agent as genuine. Same strip as [`sanitize_diagnostic`]; no byte cap of its
+/// own, because the ring already bounds what it captured.
+fn sanitize_stderr_tail(tail: &str) -> String {
+    sanitize_diagnostic(tail, tail.len())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginHealth {
@@ -236,7 +291,7 @@ impl Sidecar {
             // A sidecar that dies during startup (dyld/link failure, panic before
             // the handshake write) leaves only an EOF here; echo its stderr so the
             // real cause is visible instead of a bare "failed to fill whole buffer".
-            let tail = stderr_ring.tail();
+            let tail = sanitize_stderr_tail(&stderr_ring.tail());
             if !tail.is_empty() {
                 tracing::warn!(lang = %lang, stderr = %tail, "Phase B: sidecar failed during handshake");
             }
@@ -350,7 +405,7 @@ impl Sidecar {
     fn mark_crashed(&self) {
         // Surface the sidecar's own last words — a libclang/parse/link failure it
         // printed before dying is otherwise lost, leaving only a generic crash.
-        let tail = self.stderr_ring.tail();
+        let tail = sanitize_stderr_tail(&self.stderr_ring.tail());
         if tail.is_empty() {
             tracing::warn!(lang = %self.language, "Phase B: sidecar crashed (no stderr captured)");
         } else {
@@ -424,8 +479,17 @@ impl Transport for Sidecar {
     fn invoke_phase_b(&self, mut req: InvokeRequest) -> Result<InvokeResponse, IndexError> {
         // Inject the sandbox-authorized scratch dir so the sidecar can write
         // temp files (SCIP output, etc.) inside the sandbox's allowed write area.
+        //
+        // As the SIDECAR sees it, not as this process does. On Linux bwrap binds
+        // the host directory at a fixed mount point instead of at its own path,
+        // so sending the host path handed the sidecar a name that resolves to
+        // nothing inside its namespace: every write through the field failed and
+        // the language reported a zero-node index with no error. `ruby`, `c` and
+        // `cpp` all consume this field directly, so all three were affected.
+        // See `sandbox::sidecar_scratch_path` for why the remap is
+        // unconditional on Linux and a no-op everywhere else.
         if let Some(scratch) = self._scratch.as_ref() {
-            req.scratch = scratch.path().to_path_buf();
+            req.scratch = crate::sandbox::sidecar_scratch_path(scratch.path());
         }
         let io_lock = match &self.io {
             Some(m) => m,
@@ -471,18 +535,76 @@ impl Transport for Sidecar {
                 // A clean handshake + invoke that nonetheless yields zero nodes is
                 // the exact shape of a silent analyzer failure (e.g. libclang
                 // denied a sandbox read → every TU fails to parse → empty index).
-                // Echo the sidecar's own stderr at debug so the cause is
-                // recoverable rather than surfacing only as a generic zero-node
-                // warning with a misdirecting remedy.
+                // Echo the sidecar's own stderr so the cause is recoverable
+                // rather than surfacing only as a generic zero-node warning with
+                // a misdirecting remedy.
+                //
+                // At warn, not debug: the sidecar has already decided this run
+                // produced nothing, and its stderr is the only place the reason
+                // exists. Emitting it at debug meant the default-verbosity user
+                // saw "produced no symbols" with no way to reach the cause, and
+                // `travsr status` then blamed their project. Three separate
+                // language failures (scala's over-matching stdlib filter, php's
+                // wrong analyzer CWD, java's skipped test compilation) each
+                // stayed invisible behind exactly this line.
                 if resp.nodes.is_empty() {
-                    let tail = self.stderr_ring.tail();
+                    let tail = sanitize_stderr_tail(&self.stderr_ring.tail());
                     if !tail.is_empty() {
-                        tracing::debug!(
+                        tracing::warn!(
                             lang = %self.language,
                             stderr = %tail,
                             "Phase B: sidecar returned zero nodes; sidecar stderr follows"
                         );
                     }
+                }
+                // Structured diagnostics, unlike the stderr echo above, are NOT
+                // gated on an empty result. That gate is why they exist: a run
+                // that returns some nodes and still knows it is degraded (java
+                // skipping test compilation, a stale emitter binary) had no way
+                // to be heard, because the only channel opened on total failure.
+                //
+                // "The sidecar opts in per record" is not a bound. The sidecar is
+                // untrusted, so the record count and both field lengths are its
+                // choice up to the frame cap; the host caps all three itself
+                // before anything reaches the log.
+                let total = resp.diagnostics.len();
+                for d in resp.diagnostics.iter().take(MAX_DIAGNOSTICS) {
+                    // A malformed `code` costs the record its code, not its
+                    // message: the prose is the part a developer reads, and
+                    // dropping the record would lose a real diagnostic over a
+                    // field that is only an index key.
+                    let code = if is_diagnostic_code(&d.code) {
+                        d.code.as_str()
+                    } else {
+                        "plugin.invalid-code"
+                    };
+                    let message = sanitize_diagnostic(&d.message, MAX_DIAGNOSTIC_MESSAGE_BYTES);
+                    match d.severity {
+                        // An unrecognised severity rides with `Warning`: it came
+                        // from a sidecar newer than this host, which thought the
+                        // record mattered enough to send.
+                        DiagnosticSeverity::Warning | DiagnosticSeverity::Unknown => {
+                            tracing::warn!(
+                                lang = %self.language,
+                                code = %code,
+                                "Phase B: {}",
+                                message
+                            )
+                        }
+                        DiagnosticSeverity::Info => tracing::info!(
+                            lang = %self.language,
+                            code = %code,
+                            "Phase B: {}",
+                            message
+                        ),
+                    }
+                }
+                if total > MAX_DIAGNOSTICS {
+                    tracing::warn!(
+                        lang = %self.language,
+                        dropped = total - MAX_DIAGNOSTICS,
+                        "Phase B: sidecar sent {total} diagnostics; logged the first {MAX_DIAGNOSTICS}"
+                    );
                 }
                 Ok(resp)
             }
@@ -554,5 +676,40 @@ mod tests {
     fn sidecar_stub_is_disabled() {
         let s = Sidecar::stub("kotlin");
         assert!(matches!(s.health(), PluginHealth::Disabled(_)));
+    }
+
+    // A hostile sidecar's diagnostic fields are attacker-chosen: the host must
+    // cut them on a char boundary rather than panicking mid-codepoint.
+    #[test]
+    fn sanitize_diagnostic_cuts_on_a_char_boundary() {
+        let cut = sanitize_diagnostic("\u{e9}\u{e9}\u{e9}", 3);
+        assert_eq!(cut, "\u{e9}");
+    }
+
+    // Newlines are what forge a log line; EscapeGuard does not touch them.
+    #[test]
+    fn sanitize_diagnostic_strips_control_characters() {
+        let cut = sanitize_diagnostic("a\nb\r\u{1b}[31mc", MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert_eq!(cut, "a b  [31mc");
+    }
+
+    // The stderr echo is 64 sidecar-chosen lines. Unflattened, each newline is
+    // a log line an agent reading `get_daemon_logs` would take as genuine.
+    #[test]
+    fn sanitize_stderr_tail_flattens_forged_log_lines() {
+        let tail = sanitize_stderr_tail("real failure\nERROR travsr: shut the daemon down");
+        assert_eq!(tail, "real failure ERROR travsr: shut the daemon down");
+    }
+
+    #[test]
+    fn diagnostic_code_shape_is_enforced() {
+        assert!(is_diagnostic_code("java.tests-not-compiled"));
+        assert!(is_diagnostic_code("emitter.version_mismatch"));
+        assert!(!is_diagnostic_code(""));
+        assert!(!is_diagnostic_code("has space"));
+        assert!(!is_diagnostic_code("forged\nevent=shutdown"));
+        assert!(!is_diagnostic_code(
+            &"a".repeat(MAX_DIAGNOSTIC_CODE_BYTES + 1)
+        ));
     }
 }

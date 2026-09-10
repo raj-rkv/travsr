@@ -688,7 +688,14 @@ pub static CATALOG: &[PhaseBEntry] = &[
         windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/php"),
         command: "scip-php",
-        args: &["{root}", "--output", "{output}"],
+        // scip-php takes no positional root and has no `--output`: it indexes its
+        // own working directory and hardcodes `./index.scip` (bin/scip-php:39,53,
+        // read by the travsr-lang-php sidecar, crates/php/src/main.rs:211). The
+        // sidecar therefore runs it in the repo and moves the artifact into
+        // scratch, which is what the `RepoWrite::File("index.scip")` grant in
+        // sandbox/toolchain.rs exists for. The form recorded here used to say
+        // otherwise, which read as if that grant were unnecessary.
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install php",

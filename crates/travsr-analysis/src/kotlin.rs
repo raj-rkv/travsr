@@ -65,6 +65,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         },
     ],
     post_parse: None,
+    name_hook: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_kotlin_ng::LANGUAGE),
 };
 

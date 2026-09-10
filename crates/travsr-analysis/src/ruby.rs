@@ -87,6 +87,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     decl_kinds: &[],
     type_refinements: &[],
     post_parse: Some(ruby_post_parse),
+    name_hook: None,
     get_grammar: || tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
 };
 

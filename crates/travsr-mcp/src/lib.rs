@@ -111,7 +111,76 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
     server::run_global()
 }
 
-/// Wire the active embed backend's KNN hook into `store`.
+/// The lazily-armed embed hooks for one repo, as installed on a `SqliteStore`.
+///
+/// Cloning is four `Arc` clones — the sidecar behind them is shared, never
+/// respawned. Held by [`embed_hook_cache`] so global mode, which opens a fresh
+/// read-only store per tool call, does not re-arm on every call.
+#[derive(Clone)]
+struct EmbedHooks {
+    knn: travsr_store::EmbedKnnHook,
+    doc: travsr_store::EmbedKnnHook,
+    score: travsr_store::EmbedScoreHook,
+    readiness: std::sync::Arc<travsr_store::EmbedReadiness>,
+}
+
+/// Armed embed hooks, keyed by graph.db path.
+///
+/// Single-repo mode arms once at startup and holds the store for the life of the
+/// process. Global mode has no such store: it opens one per tool call and drops
+/// it at the end, which would spawn, model-load and kill a sidecar every time —
+/// measured at ~2.1 s of arm cost per `get_context` on a small repo. This keeps
+/// the hooks (and so the sidecar) alive across calls.
+///
+/// One entry per repo the process has actually served a named `get_context`
+/// for, capped at [`MAX_CACHED_EMBED_HOOKS`]. Only [`inject_embed_hook`]
+/// inserts; the global fan-out reads through [`inject_cached_embed_hook`] so a
+/// query with no `repo` argument can never spawn a sidecar per registered repo.
+fn embed_hook_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, EmbedHooks>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, EmbedHooks>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Ceiling on cached entries. Each one pins a sidecar process holding a
+/// 200-1400 MB ONNX model for the life of the daemon, and global mode puts no
+/// bound on how many repos one process is asked to serve. Past the cap the
+/// hooks are still built and used for the call, they are just not kept: those
+/// repos pay the arm cost again next time instead of the process growing
+/// without limit.
+const MAX_CACHED_EMBED_HOOKS: usize = 8;
+
+fn install_embed_hooks(store: &mut SqliteStore, hooks: EmbedHooks) {
+    store.set_embed_readiness(hooks.readiness);
+    store.set_embed_knn_hook(hooks.knn);
+    store.set_embed_doc_knn_hook(hooks.doc);
+    store.set_embed_score_hook(hooks.score);
+}
+
+/// Install already-armed hooks for `db_path`, if some earlier call armed them.
+///
+/// Never starts a sidecar, so it is safe on the global fan-out path: a repo that
+/// a previous named-repo query warmed keeps its semantic lane for free, and one
+/// that was never warmed stays lexical-only. Returns whether hooks were installed.
+pub(crate) fn inject_cached_embed_hook(store: &mut SqliteStore, db_path: &Path) -> bool {
+    // A poisoned cache degrades to "no hook" rather than bringing down the query.
+    let hooks = embed_hook_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(db_path).cloned());
+    match hooks {
+        Some(hooks) => {
+            install_embed_hooks(store, hooks);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Wire the active embed backend's KNN hook into `store`, arming the sidecar on
+/// first use for this `db_path` and reusing it on every later call.
 ///
 /// The sidecar loads a 200–1400 MB ONNX model at startup — this takes 15–25 s
 /// on a cold start. To keep `serve_stdio` (and the extension's `initialize`
@@ -121,7 +190,44 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
 /// sidecar is still loading, and delegates to the real KNN hook once it is ready.
 /// This produces "embedding in progress" signals in `get_context` responses rather
 /// than blank results or a 15–25 s connect stall.
-fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+///
+/// The lookup and the insert happen under ONE lock. Releasing it around
+/// `build_embed_hooks` let two concurrent SSE requests for the same cold repo
+/// both miss, both spawn a sidecar, and the loser's process stay alive with its
+/// model resident and nothing referencing it. `build_embed_hooks` only starts
+/// the arming thread, so holding the lock across it does not serialise the
+/// 15-25 s model load.
+pub(crate) fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
+    // A poisoned cache degrades to "no hook" rather than bringing down the query.
+    let Ok(mut cache) = embed_hook_cache().lock() else {
+        return;
+    };
+    let hooks = match cache.get(db_path) {
+        Some(hooks) => hooks.clone(),
+        None => {
+            let Some(hooks) = build_embed_hooks(store, db_path) else {
+                return;
+            };
+            if cache.len() < MAX_CACHED_EMBED_HOOKS {
+                cache.insert(db_path.to_path_buf(), hooks.clone());
+            } else {
+                tracing::debug!(
+                    cap = MAX_CACHED_EMBED_HOOKS,
+                    "embed hook cache full, not retaining hooks for {}",
+                    db_path.display()
+                );
+            }
+            hooks
+        }
+    };
+    drop(cache);
+    install_embed_hooks(store, hooks);
+}
+
+/// Build (and start arming) the embed hooks for `db_path`, or `None` when this
+/// repo has no embedding index, no installed backend binary, or no resolvable
+/// backend — in which case no sidecar is started.
+fn build_embed_hooks(store: &SqliteStore, db_path: &Path) -> Option<EmbedHooks> {
     use std::sync::{Arc, Mutex};
 
     use travsr_error::StoreError;
@@ -134,10 +240,10 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
     // Guard: no embed.db → nothing to query; skip to avoid spawning a sidecar
     // against a non-existent HNSW index.
     if !db_path.with_file_name("embed.db").exists() {
-        return;
+        return None;
     }
 
-    let Some(home) = dirs::home_dir() else { return };
+    let home = dirs::home_dir()?;
     // #481: the embedding backend is a per-repo setting; `~/.travsr/embed.toml`
     // is only the fallback. Reading the machine-global id here started the
     // sidecar with a different model than this repo's index was built with, so
@@ -155,7 +261,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         .and_then(lookup_embed_backend)
         .or_else(|| embed_backends().first())
         .cloned();
-    let Some(backend) = backend else { return };
+    let backend = backend?;
 
     // Mirror the daemon's guard (travsr-daemon: `embed model_id mismatch`): if
     // the index records a model, the sidecar's must match it or the hooks would
@@ -169,7 +275,7 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
         .join(backend.binary_filename());
     // Fast path: if the binary isn't installed there's nothing to do.
     if !binary.exists() {
-        return;
+        return None;
     }
 
     let db_path_bg = db_path.to_path_buf();
@@ -291,8 +397,6 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             Some(hook) => hook(query, k),
         }
     });
-    store.set_embed_readiness(readiness);
-    store.set_embed_knn_hook(meta);
 
     // #376 Phase 2: doc-space meta-hook, same lazy-slot shape as `meta` above.
     // While `doc_slot` is `None` (sidecar warming, unsupported, or no doc-chunk
@@ -307,7 +411,6 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             Some(hook) => hook(query, k),
         }
     });
-    store.set_embed_doc_knn_hook(meta_doc);
 
     // RFC-019: meta direct-cosine oracle hook. Reads the lazily-armed query hook;
     // while the sidecar warms (slot None) it scores nothing, so the classifier and
@@ -327,6 +430,11 @@ fn inject_embed_hook(store: &mut SqliteStore, db_path: &Path) {
             None => Ok(vec![]),
         }
     });
-    store.set_embed_score_hook(meta_score);
     tracing::info!("embed plugin hook installed (lazy, sidecar starting in background)");
+    Some(EmbedHooks {
+        knn: meta,
+        doc: meta_doc,
+        score: meta_score,
+        readiness,
+    })
 }

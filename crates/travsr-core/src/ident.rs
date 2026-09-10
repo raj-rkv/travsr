@@ -148,6 +148,34 @@ pub fn leaf_of(sig: &str) -> &str {
     body.rsplit('.').next().unwrap_or(body)
 }
 
+/// The leading keyword of an Objective-C selector, or `name` unchanged.
+///
+/// Objective-C spells one method name across several keywords
+/// (`policyWithPinningMode:withPinnedCertificates:`), and Phase A stores that
+/// whole selector as the node's leaf so two selectors sharing a leading keyword
+/// stay distinct nodes. A developer, though, types and reads the leading
+/// keyword alone, the only part that appears at a call site as a contiguous
+/// word, so symbol lookup has to be able to get back from the stored selector
+/// to that head.
+///
+/// A stored selector always carries a trailing `:`, which is what identifies
+/// one here. No other language's leaf ends in `:`: a Rust path
+/// (`crate::repo::find_git_root`) or a C++ qualified name (`Widget::draw`)
+/// spells its separator as `::` and never terminates on it.
+///
+/// ```text
+/// selector_head("policyWithPinningMode:withPinnedCertificates:") == "policyWithPinningMode"
+/// selector_head("reload")                                        == "reload"
+/// selector_head("crate::repo::find_git_root")   == "crate::repo::find_git_root"
+/// ```
+pub fn selector_head(name: &str) -> &str {
+    if name.ends_with(':') {
+        name.split(':').next().unwrap_or(name)
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +323,40 @@ mod tests {
         // the acronym-segmentation follow-up has a failing-by-design anchor
         // to flip.
         assert!(!contains_token("http", "HTTPServer"));
+    }
+
+    #[test]
+    fn selector_head_takes_the_leading_keyword() {
+        assert_eq!(
+            selector_head("policyWithPinningMode:withPinnedCertificates:"),
+            "policyWithPinningMode"
+        );
+        assert_eq!(
+            selector_head("policyWithPinningMode:"),
+            "policyWithPinningMode"
+        );
+        assert_eq!(selector_head("anon::"), "anon");
+    }
+
+    #[test]
+    fn selector_head_leaves_every_other_leaf_alone() {
+        assert_eq!(selector_head("reload"), "reload");
+        assert_eq!(
+            selector_head("crate::repo::find_git_root"),
+            "crate::repo::find_git_root"
+        );
+        assert_eq!(selector_head("Widget::draw"), "Widget::draw");
+        assert_eq!(selector_head(""), "");
+    }
+
+    #[test]
+    fn leaf_of_keeps_a_whole_objc_selector() {
+        // The kind prefix is split at the FIRST colon, so the selector's own
+        // colons survive into the leaf.
+        assert_eq!(
+            leaf_of("method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:"),
+            "policyWithPinningMode:withPinnedCertificates:"
+        );
     }
 
     #[test]

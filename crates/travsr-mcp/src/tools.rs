@@ -615,11 +615,22 @@ fn read_note_signals(
 /// DefinesBinding callers. The precedence policy in #47 will refine this further.
 ///
 /// Empty string when nothing is found.
-pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
+///
+/// `path` is the same optional hint `find_references` takes, with the same
+/// meaning: a filename, relative path, directory prefix or path fragment that
+/// picks one definition of an overloaded name. Without it an ambiguous symbol
+/// can only be refused, and on this repo 11% of leaf names are ambiguous.
+pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     // SEC-002: validate before forwarding to store queries.
     if let Err(reason) = validate_mcp_arg(symbol) {
         tracing::warn!("get_callers rejected invalid arg: {reason}");
         return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_callers rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     // Phase B deferred: a HEAD commit exists but phase_b_commit hasn't been
     // stamped yet, meaning Phase B was deferred to the daemon background
@@ -631,9 +642,19 @@ pub fn get_callers(store: &SqliteStore, symbol: &str) -> String {
         return phase_b_pending_json("Semantic call-edge index");
     }
     // SEC-001: sanitize raw result before returning to MCP client / LLM.
+    // Use the larger find-output limit, not the 4 KiB scalar cap: this tool
+    // enumerates one row per call site exactly as `find_references` does, and
+    // the scalar cap was cutting ~80% of a hub symbol's callers off mid-line
+    // with no notice (192 callers of `open_in_memory` arrived as 38 rows).
     // #617: append the staleness note (marker behind HEAD / dirty flag) so an
     // empty caller list is never mistaken for an authoritative "no callers".
-    with_phase_b_note(store, sanitize_for_mcp(&get_callers_raw(store, symbol)))
+    with_phase_b_note(
+        store,
+        wrap_envelope(&sanitize_mcp_body_with_limit(
+            &get_callers_raw(store, symbol, path),
+            FIND_OUTPUT_LIMIT,
+        )),
+    )
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -674,29 +695,96 @@ fn crash_caveat(lang: &str) -> String {
     )
 }
 
-fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
+fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     use travsr_core::EdgeKind;
 
-    let nodes = match store.search_nodes_by_name(symbol) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("get_callers search error: {e}");
-            return String::new();
+    // Resolve the name through the same ladder `find_references` and `travsr
+    // graph` use, so two distinct definitions that share a name are never
+    // collapsed to whichever one the FTS ranking happened to put first. That
+    // silent pick reported one definition's callers under the other's name, and
+    // a reader concluded the unreported definition had none.
+    //
+    // Only an *exact* resolution (full signature, exact simple name, selector
+    // head, dotted member) reaches this guard, so the partial matching the tool
+    // schema documents is untouched: a partial query resolves to `None` here and
+    // falls through to the same name search as before.
+    let seeds: Vec<CoreNode> = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => vec![n],
+        // A selector family is one Objective-C method spelled at several
+        // arities, not rival definitions, and no `path` could choose between
+        // them. Union their callers, as `find_references` unions their sites.
+        RefTarget::Family(nodes) => nodes,
+        RefTarget::Ambiguous(nodes) => {
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "Re-run with a `path` hint to pick one of:",
+            )
+        }
+        RefTarget::None => {
+            // #647 parity with `find_references`: a `path` hint that filtered
+            // out every definition must not fall through to a partial name
+            // search that ignores the hint, which would answer about a symbol
+            // somewhere else entirely.
+            if let Some(hint) = path {
+                match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => {
+                        return path_miss_message(symbol, hint, &nodes)
+                    }
+                    RefTarget::None => {}
+                }
+            }
+            let partial = match store.search_nodes_by_name(symbol) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("get_callers search error: {e}");
+                    return String::new();
+                }
+            };
+            // The `path` hint has to survive this fallback too. It used to be
+            // dropped here and the first FTS row won, so a hint naming one file
+            // was answered from a same-named symbol somewhere else entirely —
+            // the confident-wrong answer #647 removed from the exact tiers,
+            // still reachable through this one. Scoping here keeps the
+            // documented partial matching and makes the hint mean the same
+            // thing on every tier.
+            match path {
+                None => partial.into_iter().take(1).collect(),
+                Some(hint) => {
+                    let scoped: Vec<CoreNode> = partial
+                        .iter()
+                        .filter(|n| path_hint_matches(&n.vname.path, hint))
+                        .take(1)
+                        .cloned()
+                        .collect();
+                    // A hint that matches none of them says so, rather than
+                    // widening silently back to the whole repo (#647) or
+                    // answering an empty list that reads as "no callers".
+                    if scoped.is_empty() && !partial.is_empty() {
+                        return path_miss_message(symbol, hint, &partial);
+                    }
+                    scoped
+                }
+            }
         }
     };
 
-    let seed = match nodes.first() {
+    let seed = match seeds.first() {
         Some(n) => n,
         None => return String::new(),
     };
 
-    let edges = match store.iter_edges_to(seed.id) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("get_callers edge query error: {e}");
-            return String::new();
+    let mut edges = Vec::new();
+    for node in &seeds {
+        match store.iter_edges_to(node.id) {
+            Ok(e) => edges.extend(e),
+            Err(e) => {
+                tracing::warn!("get_callers edge query error: {e}");
+                return String::new();
+            }
         }
-    };
+    }
 
     let relevant: Vec<_> = edges
         .iter()
@@ -716,10 +804,11 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
 
     // #399: resolve exact call-site `path:line`s for true call edges. A RefCall
     // edge is deduplicated by `(src,dst,kind)`, so one edge can stand for several
-    // calls from the same caller — we re-scan the caller's source span for the
-    // callee's name to recover each site. Requires `repo_root` (stored in meta by
-    // init); absent (older indexes) or unresolvable → fall back to the caller's
-    // definition line, never worse than before.
+    // calls from the same caller — the recorded `edge_sites` occurrences recover
+    // each site. Only when a language feeds no occurrence rows do we re-scan the
+    // caller's source span for the callee's name, which requires `repo_root`
+    // (stored in meta by init); absent (older indexes) or unresolvable → fall
+    // back to the caller's definition line, never worse than before.
     let repo_root = resolve_repo_root(store);
     let callee_name = simple_name(&seed.vname.signature);
     const MAX_SITES_PER_CALLER: usize = 50;
@@ -729,27 +818,56 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
         let Some(src_node) = node_map.get(&edge.src) else {
             continue;
         };
-        // RFC-027 section 10: mark an un-ratified edge so a reader never takes
-        // the live overlay for committed truth. Only `live` is called out —
-        // every other provenance is ratified, and tagging all of them would be
-        // noise on the common case.
-        let live = live_marker(edge);
-        // True call edge: try to expand into exact call-site lines.
+        // Mark an edge a reader must not take at face value. Two cases: an
+        // un-ratified `live` overlay edge (RFC-027 section 10), and a ref/call
+        // edge resolved by leaf-name matching rather than by type.
+        let live = provenance_marker(edge);
+        // True call edge: expand into exact call-site lines.
+        //
+        // The recorded occurrences (the rows `find_references` also reads) are
+        // the trusted set. The textual re-scan runs only when a language feeds
+        // no occurrence rows at all, because it matches the callee's name
+        // anywhere in the caller's span: a comment, a string, or the callee's
+        // own `const f = (…)` declaration. Preferring the rows removed 3127
+        // phantom sites across 1081 edges on this repo.
+        //
+        // Known gap, deliberately left open: the gate is per (src,dst) EDGE, so
+        // an emitter that records SOME of an edge's calls but not all of them
+        // under-reports. scip-dotnet emits nothing for a generic invocation, so
+        // a C# caller invoking one callee once generically and once not shows a
+        // single site. Running the scan alongside the rows to recover that
+        // costs a source read per call edge in every language and puts comment
+        // and string mentions back in the output as extra marked lines, which
+        // is a worse trade than the one narrow shape it recovers. Closing it
+        // properly means fixing the emitter's occurrence coverage.
         if tag == "[call]" {
-            if let Some(root) = &repo_root {
-                let sites = call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER);
-                if !sites.is_empty() {
-                    for line in sites {
-                        lines.push(format!(
-                            "{tag} {} ({}) \u{2014} {}:{}{live}",
-                            display_label(src_node),
-                            src_node.kind,
-                            src_node.vname.path,
-                            line
-                        ));
+            let recorded = store
+                .edge_call_site_lines(edge.src, edge.dst, MAX_SITES_PER_CALLER)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("get_callers occurrence lookup error: {e}");
+                    Vec::new()
+                });
+            let sites: Vec<u32> = if recorded.is_empty() {
+                match repo_root.as_ref() {
+                    Some(root) => {
+                        call_site_lines(src_node, root, &callee_name, MAX_SITES_PER_CALLER)
                     }
-                    continue;
+                    None => Vec::new(),
                 }
+            } else {
+                recorded
+            };
+            if !sites.is_empty() {
+                for line in sites {
+                    lines.push(format!(
+                        "{tag} {} ({}) \u{2014} {}:{}{live}",
+                        display_label(src_node),
+                        src_node.kind,
+                        src_node.vname.path,
+                        line
+                    ));
+                }
+                continue;
             }
         }
         // Structural edge, or a call edge with no resolvable site / no repo_root:
@@ -763,6 +881,20 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
             loc
         ));
     }
+    // Cap the rows here rather than letting the byte limit cut one in half, and
+    // say how many were left out. A hub symbol has thousands of call sites and
+    // no reader can act on all of them; what a reader cannot survive is a list
+    // that stops without saying it stopped.
+    let total = lines.len();
+    if total > MAX_CALLER_ROWS {
+        lines.truncate(MAX_CALLER_ROWS);
+        lines.push(format!("[showing {MAX_CALLER_ROWS} of {total} callers]"));
+    }
+    // The sigil is the last thing appended to a row, so the rows that survived
+    // the cap are what decide whether the legend is worth a line.
+    if lines.iter().any(|l| l.ends_with(HEURISTIC_SIGIL_ROW)) {
+        lines.push(HEURISTIC_LEGEND.to_string());
+    }
     // #715: a crash in this language's last Phase B run leaves partial coverage
     // while the marker reads complete, so this list may be missing callers in the
     // un-indexed files. Attach the caveat to the confident (non-empty) answer.
@@ -772,17 +904,64 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str) -> String {
     lines.join("\n")
 }
 
-/// RFC-027 section 10: the suffix marking an edge as part of the live overlay.
+/// Cap on the caller rows `get_callers` returns, mirroring
+/// [`MAX_REFERENCE_SITES`] for the tool that enumerates the same shape of row.
+const MAX_CALLER_ROWS: usize = 500;
+
+/// The suffix marking an edge whose confidence differs from the default.
 ///
-/// Empty for every ratified provenance, so the common case reads exactly as it
-/// did before. A `live` edge is resolved but not yet ratified — precise enough
-/// to act on, and honest that the commit-gated pipeline has not confirmed it
-/// yet. Consumers that need ground truth filter it out; consumers that ignore
-/// provenance simply see a fresher graph, which is the additive default
-/// section 10 asks for.
-fn live_marker(edge: &travsr_core::Edge) -> &'static str {
-    if edge.provenance.as_deref() == Some("live") {
-        " [live: resolved from your uncommitted edit, not yet ratified]"
+/// Empty for a type-resolved, ratified edge, so the common case reads exactly
+/// as it did before. Two cases are called out:
+///
+/// * `live` (RFC-027 section 10): resolved but not yet ratified, precise
+///   enough to act on, and honest that the commit-gated pipeline has not
+///   confirmed it. Consumers needing ground truth filter it out; consumers
+///   ignoring provenance simply see a fresher graph.
+/// * `tree-sitter` on a `ref/call` edge: produced by `resolve_unresolved_calls`
+///   matching a bare callee name against the graph, not by a compiler resolving
+///   a type. Ratified, and still capable of being wrong. Its uniqueness gate
+///   ("exactly one same-named candidate") is evidence about the *index*, not
+///   about the call: a local binding the Phase A parser does not model (a JS
+///   `const f = () => …`) leaves the only same-named node in an unrelated
+///   package as the unique winner, and the edge is written as fact. The gate is
+///   also skipped entirely when the call carries a crate hint, which fans out to
+///   every path-matching candidate.
+///
+/// The old comment here asserted that "every other provenance is ratified" and
+/// stopped there, which conflated ratified with correct. Restricted to
+/// `RefCall`: Phase A's `defines/binding` and `depends` edges are also
+/// `tree-sitter` and are structural facts from the AST, not name guesses.
+fn provenance_marker(edge: &travsr_core::Edge) -> &'static str {
+    match edge.provenance.as_deref() {
+        Some("live") => " [live: resolved from your uncommitted edit, not yet ratified]",
+        Some("tree-sitter") if edge.kind == travsr_core::EdgeKind::RefCall => HEURISTIC_SIGIL_ROW,
+        _ => "",
+    }
+}
+
+/// The name-matched-edge caveat, spelled out per site by `find_references` (via
+/// `RefSite::heuristic`), where one occurrence line carries it at most once.
+const HEURISTIC_MARKER: &str = " [heuristic: matched by name, not resolved by type]";
+
+/// The same caveat on a `get_callers` row: one character, plus one legend line
+/// at the end of the answer.
+///
+/// [`HEURISTIC_MARKER`] is 49 bytes on a ~70-byte row, and on a Phase-A-only
+/// language (Go, Java, C#, Ruby, PHP) essentially every call edge is
+/// name-matched, so the caveat itself was pushing callers out of the response.
+/// The CLI tree already made this trade for the same reason
+/// (`travsr-cli`'s `HEURISTIC_SIGIL`); the legend repeats its wording verbatim
+/// so the two surfaces cannot describe the same edge in two different words.
+const HEURISTIC_SIGIL_ROW: &str = " ~";
+
+/// Printed once, after the rows, and only when a marked row was actually
+/// rendered: a legend for a mark that is not on screen is noise.
+const HEURISTIC_LEGEND: &str = "~ = matched by name, not resolved by type";
+
+/// The marker for one occurrence site, empty unless it is name-matched.
+fn site_marker(site: &travsr_core::RefSite) -> &'static str {
+    if site.heuristic {
+        HEURISTIC_MARKER
     } else {
         ""
     }
@@ -794,9 +973,20 @@ fn live_marker(edge: &travsr_core::Edge) -> &'static str {
 /// `fn:SqliteStore.iter_edges_to` → `iter_edges_to`,
 /// `fn:crate::repo::find_git_root` → `find_git_root`.
 fn simple_name(signature: &str) -> String {
-    // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
-    // then split off any `.`/`#` method/scope qualifier.
-    let after_kind = signature.rsplit(':').next().unwrap_or(signature);
+    // An Objective-C selector spells its own colons inside the name
+    // (`method:Foo.setWidth:height:`), so the `rsplit(':')` below would eat the
+    // whole thing and return "". A stored selector always ends in `:`, which no
+    // other language's signature does, so split only the `kind:` prefix there
+    // and keep the rest.
+    let after_kind = if signature.ends_with(':') {
+        signature
+            .split_once(':')
+            .map_or(signature, |(_, rest)| rest)
+    } else {
+        // rsplit(':') drops the `kind:` prefix and yields the last `::` component;
+        // then split off any `.`/`#` method/scope qualifier.
+        signature.rsplit(':').next().unwrap_or(signature)
+    };
     after_kind
         .rsplit(['.', '#'])
         .next()
@@ -884,20 +1074,29 @@ pub fn get_dependencies_global(
             .and_then(|db| repo_head_from_registry_path(db));
         append_head_note(store, result, head.as_deref())
     });
-    // SEC-001: sanitize the fully-aggregated string once.
-    sanitize_for_mcp(&raw)
+    // SEC-001: sanitize the fully-aggregated string once, with the same
+    // row-enumerating limit the single-repo path uses: an aggregate over N
+    // repos is the last place a 4 KiB cap belongs.
+    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
 /// Global variant of `get_callers` — searches one named repo or all registered repos.
 pub fn get_callers_global(
     repos: &HashMap<String, PathBuf>,
     symbol: &str,
+    path: Option<&str>,
     repo: Option<&str>,
 ) -> String {
     // SEC-002: validate before registry + store queries.
     if let Err(reason) = validate_mcp_arg(symbol) {
         tracing::warn!("get_callers_global rejected invalid arg: {reason}");
         return String::new();
+    }
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_callers_global rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         // #617 + #645: per-repo notes — each store carries its own Phase B
@@ -906,7 +1105,8 @@ pub fn get_callers_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(store, get_callers_raw(store, symbol), head.as_deref());
+        let raw = get_callers_raw(store, symbol, path);
+        let result = append_read_notes(store, raw, head.as_deref());
         if result.is_empty() || single {
             result
         } else {
@@ -928,11 +1128,11 @@ pub fn get_callers_global(
 /// the spirit of `MAX_SITES_PER_CALLER` but is per-symbol, not per-caller.
 const MAX_REFERENCE_SITES: usize = 500;
 
-/// Byte cap for `find_references` / `find_pattern` output. The default scalar
-/// cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped 500-site list
-/// mid-line and drop the truncation notice — the same trap `get_snippets`
-/// avoids. These tools enumerate up to `MAX_*` rows, so they wrap with this
-/// larger limit instead (still well under the 1 MiB MCP hard ceiling).
+/// Byte cap for `find_references` / `find_pattern` / `get_callers` output. The
+/// default scalar cap (`sanitize_for_mcp`, 4 KiB) would truncate a capped
+/// 500-row list mid-line and drop the truncation notice, the same trap
+/// `get_snippets` avoids. These tools enumerate up to `MAX_*` rows, so they wrap
+/// with this larger limit instead (still well under the 1 MiB MCP hard ceiling).
 const FIND_OUTPUT_LIMIT: usize = 512_000;
 
 /// Resolution outcome for a `find_references` symbol argument.
@@ -942,6 +1142,15 @@ pub(crate) enum RefTarget {
     /// Multiple definitions and no disambiguating `path` — return the list so the
     /// caller can re-query with a `path` hint (never silently pick `[0]`).
     Ambiguous(Vec<CoreNode>),
+    /// One Objective-C method family reached by its selector head: every
+    /// arity of `policyWithPinningMode:` when the query was
+    /// `policyWithPinningMode`. Distinct from [`Self::Ambiguous`] on purpose:
+    /// these are not rival definitions a `path` hint could choose between, they
+    /// are the same method spelled at different arities in one class, and the
+    /// head is the only thing a developer can type for them. References are the
+    /// union over the family; a caller who wants one arity types the full
+    /// selector, which resolves uniquely.
+    Family(Vec<CoreNode>),
     /// No definition matched the name.
     None,
 }
@@ -1014,6 +1223,31 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
                 .collect(),
             Err(e) => {
                 tracing::warn!("resolve_symbol_nodes search '{symbol}': {e}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Tier 2b: Objective-C selector head. Phase A stores the whole selector
+    // (`method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:`)
+    // so selectors sharing a leading keyword stay distinct nodes, but the
+    // leading keyword is the only part a developer types. Match on it, and only
+    // once the exact tiers above have found nothing, so this can never widen a
+    // name that already resolves. `selector_head` returns a non-selector leaf
+    // unchanged, so a plain name reaching here still matches nothing new.
+    if candidates.is_empty() && !symbol.contains(':') {
+        candidates = match store.search_nodes_by_name(symbol) {
+            Ok(nodes) => nodes
+                .into_iter()
+                .filter(|n| {
+                    n.kind != "file"
+                        && n.kind != "import"
+                        && travsr_core::ident::selector_head(&simple_name(&n.vname.signature))
+                            == symbol
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("resolve_symbol_nodes selector head '{symbol}': {e}");
                 Vec::new()
             }
         };
@@ -1103,6 +1337,14 @@ pub(crate) fn resolve_reference_targets(
         }
     }
 
+    // An Objective-C selector family reached by its head is one method, not
+    // rival definitions, see `RefTarget::Family`. Same class, same head, and
+    // every member an actual multi-part selector; two classes that both declare
+    // a `policyWithPinningMode:` are still genuinely ambiguous and fall through.
+    if candidates.len() > 1 && is_selector_family(&candidates, symbol) {
+        return RefTarget::Family(candidates);
+    }
+
     match candidates.len() {
         0 => RefTarget::None,
         1 => candidates
@@ -1113,14 +1355,53 @@ pub(crate) fn resolve_reference_targets(
     }
 }
 
-/// #647: message for a `path` hint that matched no definition of a symbol that
-/// does resolve elsewhere. Shows where the symbol actually lives so the answer
-/// is never mistaken for a real "0 references".
-fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
-    let mut out = format!(
-        "'{symbol}' resolves, but no definition is under path '{hint}'. It is defined at:\n"
-    );
-    for n in defs.iter().take(MAX_REFERENCE_SITES) {
+/// Whether every candidate is a multi-part Objective-C selector of ONE class
+/// whose leading keyword is `head`: the [`RefTarget::Family`] test.
+///
+/// Three things must agree, and all three are load-bearing:
+///
+/// * the language is Objective-C. Nothing else spells a method name with
+///   embedded colons, and the test used to run for every language on nothing
+///   but `leaf.ends_with(':')`.
+/// * the container name. Without it two different methods union.
+/// * the container's PATH. The container is only a `String` cut out of the
+///   signature, so name equality alone merged two classes that happen to share
+///   a name (a vendored pod duplicated under two paths, a category, a name
+///   colliding across two static libs) into one family, and `get_callers` then
+///   presented two methods' callers as one method's. Two same-named classes in
+///   two files are real ambiguity a `path` hint resolves.
+fn is_selector_family(candidates: &[CoreNode], head: &str) -> bool {
+    let container_of = |sig: &str| -> Option<String> {
+        let body = sig.split_once(':').map_or(sig, |(_, rest)| rest);
+        body.rsplit_once('.').map(|(c, _)| c.to_string())
+    };
+    let first = match container_of(&candidates[0].vname.signature) {
+        Some(c) => c,
+        None => return false,
+    };
+    let path = candidates[0].vname.path.as_str();
+    candidates.iter().all(|n| {
+        let leaf = simple_name(&n.vname.signature);
+        n.vname.language == travsr_core::Language::ObjectiveC.as_str()
+            && n.vname.path == path
+            && leaf.ends_with(':')
+            && travsr_core::ident::selector_head(&leaf) == head
+            && container_of(&n.vname.signature).as_deref() == Some(first.as_str())
+    })
+}
+
+/// The refusal every surface returns for [`RefTarget::Ambiguous`]: the count, an
+/// `advice` sentence naming the escape hatch that surface actually offers, then
+/// one line per rival definition.
+///
+/// Shared so `find_references` and `get_callers` cannot drift into describing
+/// the same ambiguity differently, which is how `get_callers` came to describe
+/// it not at all.
+fn ambiguous_definitions_message(symbol: &str, nodes: &[CoreNode], advice: &str) -> String {
+    let total = nodes.len();
+    let shown = total.min(MAX_AMBIGUOUS_DEFINITIONS);
+    let mut out = format!("'{symbol}' is ambiguous, {total} definitions. {advice}\n");
+    for n in nodes.iter().take(shown) {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
             "  {} ({}) \u{2014} {}{}\n",
@@ -1129,6 +1410,44 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
             n.vname.path,
             loc
         ));
+    }
+    if total > shown {
+        out.push_str(&format!("[showing {shown} of {total} definitions]\n"));
+    }
+    out.trim_end().to_string()
+}
+
+/// Cap on the definition lines [`ambiguous_definitions_message`] lists.
+///
+/// Both tools now wrap with [`FIND_OUTPUT_LIMIT`], but this list stays short on
+/// its own account: `get_callers` used to wrap with `sanitize_for_mcp`'s 4 KiB
+/// scalar cap, which cut a 37-definition refusal off mid-line and dropped no
+/// notice saying so. 25 lines are all a reader can act on, and the elided count
+/// is stated rather than implied. Deliberately not `MAX_REFERENCE_SITES`: a
+/// reader cannot act on 500 rival definitions anyway, they need the `path` hint.
+const MAX_AMBIGUOUS_DEFINITIONS: usize = 25;
+
+/// #647: message for a `path` hint that matched no definition of a symbol that
+/// does resolve elsewhere. Shows where the symbol actually lives so the answer
+/// is never mistaken for a real "0 references".
+fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
+    let total = defs.len();
+    let shown = total.min(MAX_AMBIGUOUS_DEFINITIONS);
+    let mut out = format!(
+        "'{symbol}' resolves, but no definition is under path '{hint}'. It is defined at:\n"
+    );
+    for n in defs.iter().take(shown) {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} ({}) \u{2014} {}{}\n",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("[showing {shown} of {total} definitions]\n"));
     }
     out.push_str("Re-run without `path`, or with a `path` hint that matches one of these.");
     out
@@ -1285,6 +1604,20 @@ pub fn find_references_structured(
 
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        // One method family reached by its selector head: report every arity as
+        // a candidate and the union of their occurrence sites, rather than a
+        // "pick one" the caller cannot act on.
+        RefTarget::Family(nodes) => {
+            out.status = "resolved";
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            out.resolved_to = nodes.first().map(ResolvedSymbol::from_node);
+            let sites = family_reference_sites(store, &nodes);
+            let total = sites.len();
+            out.total = Some(total);
+            out.truncated = total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            return out;
+        }
         RefTarget::Ambiguous(nodes) => {
             out.status = "ambiguous";
             out.note = Some(format!(
@@ -1301,7 +1634,7 @@ pub fn find_references_structured(
             if let Some(hint) = path {
                 let elsewhere = match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => vec![n],
-                    RefTarget::Ambiguous(nodes) => nodes,
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => nodes,
                     RefTarget::None => Vec::new(),
                 };
                 if !elsewhere.is_empty() {
@@ -1354,6 +1687,7 @@ pub fn find_references_structured(
 fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> String {
     let target = match resolve_reference_targets(store, symbol, path) {
         RefTarget::Unique(n) => n,
+        RefTarget::Family(nodes) => return references_body_for_family(store, &nodes),
         RefTarget::None => {
             // #647: a `path` hint that filtered out every real definition must
             // not read as a definitive "0 references" — that is the exact
@@ -1364,32 +1698,90 @@ fn find_references_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
             if let Some(hint) = path {
                 match resolve_reference_targets(store, symbol, None) {
                     RefTarget::Unique(n) => return path_miss_message(symbol, hint, &[n]),
-                    RefTarget::Ambiguous(nodes) => return path_miss_message(symbol, hint, &nodes),
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => {
+                        return path_miss_message(symbol, hint, &nodes)
+                    }
                     RefTarget::None => {}
                 }
             }
             return String::new();
         }
         RefTarget::Ambiguous(nodes) => {
-            let mut out = format!(
-                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one:\n",
-                nodes.len()
-            );
-            for n in nodes.iter().take(MAX_REFERENCE_SITES) {
-                let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-                out.push_str(&format!(
-                    "  {} ({}) \u{2014} {}{}\n",
-                    display_label(n),
-                    n.kind,
-                    n.vname.path,
-                    loc
-                ));
-            }
-            return out.trim_end().to_string();
+            return ambiguous_definitions_message(
+                symbol,
+                &nodes,
+                "Re-run with a `path` hint to pick one:",
+            )
         }
     };
 
     references_body_for_target(store, &target)
+}
+
+/// Union of the occurrence sites of every member of a selector family,
+/// deduplicated by `path:line` and ordered the same way `reference_sites` orders
+/// one node's sites. Two arities of one selector can be used on the same source
+/// line (`[self policyWithPinningMode:m withPinnedCertificates:c]` is one line
+/// carrying both heads), so the dedup is load-bearing, not defensive.
+fn family_reference_sites(store: &SqliteStore, family: &[CoreNode]) -> Vec<travsr_core::RefSite> {
+    let mut sites: Vec<travsr_core::RefSite> = Vec::new();
+    for n in family {
+        match store.reference_sites(n.id) {
+            Ok(s) => sites.extend(s),
+            Err(e) => tracing::warn!("family_reference_sites {}: {e}", n.vname.signature),
+        }
+    }
+    sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    // Dedup on `path:line` only: `a` is the later duplicate about to be
+    // dropped, so fold its flag into the survivor rather than letting a
+    // differing `heuristic` split one site into two rows.
+    sites.dedup_by(|a, b| {
+        let same = a.path == b.path && a.line == b.line;
+        if same {
+            b.heuristic |= a.heuristic;
+        }
+        same
+    });
+    sites
+}
+
+/// Render the reference body for a selector family: which arities the head
+/// reached, then the union of their occurrence sites.
+fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> String {
+    let mut lines = Vec::new();
+    let head = format!(
+        "resolved: {} selector(s) of one method family:",
+        family.len()
+    );
+    lines.push(head);
+    for n in family {
+        let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
+        lines.push(format!(
+            "  {} ({}) \u{2014} {}{}",
+            display_label(n),
+            n.kind,
+            n.vname.path,
+            loc
+        ));
+    }
+
+    let sites = family_reference_sites(store, family);
+    if sites.is_empty() {
+        // Defer to the single-target renderer for the honest degraded/zero
+        // caveat rather than restating it: with no sites the family's first
+        // member carries exactly the same answer.
+        return references_body_for_target(store, &family[0]);
+    }
+    let total = sites.len();
+    let shown = total.min(MAX_REFERENCE_SITES);
+    lines.push(format!("{total} reference(s):"));
+    for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
+        lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
+    }
+    if total > shown {
+        lines.push(format!("[truncated: showing {shown} of {total} sites]"));
+    }
+    lines.join("\n")
 }
 
 /// Render the reference body for an already-resolved target: the `resolved:`
@@ -1415,7 +1807,7 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             lines.push(header);
             lines.push(format!("{total} reference(s):"));
             for s in sites.into_iter().take(MAX_REFERENCE_SITES) {
-                lines.push(format!("{}:{}", s.path, s.line));
+                lines.push(format!("{}:{}{}", s.path, s.line, site_marker(&s)));
             }
             if total > shown {
                 lines.push(format!("[truncated: showing {shown} of {total} sites]"));
@@ -1525,7 +1917,7 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             );
         }
         // WS-3 (C3): a Dart index built without resolved dependencies drops
-        // every cross-package reference, so "no recorded uses" would be a
+        // every cross-package reference, so "recorded no uses" would be a
         // confident zero the index cannot support even when the file itself was
         // analysed. Soften it, mirroring the partial-coverage case above.
         if target.vname.language == "dart"
@@ -1544,13 +1936,17 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
             );
         }
         // Coverage is effectively complete for this language and this symbol has
-        // neither occurrence rows nor ref/call edges: a genuine zero. (If the
-        // same name is also defined elsewhere, bare calls to it are left
-        // unindexed to avoid mis-targeting — precision over recall.)
+        // neither occurrence rows nor ref/call edges. Report that as the fact it
+        // is. We cannot tell from here whether the uses do not exist, whether an
+        // ambiguous bare call was deliberately skipped, or whether the analyzer
+        // never emitted an occurrence for the call shape at all (scip-dotnet, for
+        // one, emits nothing for a generic invocation), so do not name a cause.
         return format!(
-            "{header}\n0 reference(s). This symbol has no recorded uses. If this \
-             name is also defined elsewhere, bare calls to it are left unindexed \
-             to avoid mis-targeting; use `find_pattern` for a textual search."
+            "{header}\n0 reference(s). The index recorded no uses of this symbol. \
+             That can mean it has none, or that the call sites were not indexed: \
+             an ambiguous bare call is skipped by design, and some analyzers emit \
+             no occurrence for certain call shapes. Use `find_pattern` for a \
+             textual search to tell the two apart."
         );
     }
     let callers = store.get_nodes(&caller_ids).unwrap_or_default();
@@ -1629,7 +2025,11 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
-/// Graph-scoped textual search: `git grep` confined to a bounded file set.
+/// Textual search: `git grep` over the repo's text files, minus the paths the
+/// walker hard-skips, the paths an ignore file excludes, and known-binary
+/// formats. Deliberately WIDER than the graph's own file set: a shell script, a
+/// Makefile or a lockfile is a legitimate answer to a textual query, and an
+/// extension allowlist reported "no matches" for all of them.
 ///
 /// `scope` selects the search set:
 ///   - `None` → whole repository (tracked files).
@@ -2312,7 +2712,7 @@ fn run_git_grep(
         tracing::warn!("find_pattern re-included pass failed: {detail}");
     }
 
-    // Two filters, both closing the same gap from the other direction: git can
+    // Three filters, all closing the same gap from the other direction: git can
     // see files the walker refuses to index, so a match from one of them would
     // be a file `find_references` can never corroborate.
     //
@@ -2328,7 +2728,87 @@ fn run_git_grep(
     //    matcher the walker applies (`add_custom_ignore_filename`) keeps both
     //    tools on one set of files. Pass-2 paths are whitelisted by
     //    construction, so this half only ever drops pass-1 lines.
+    // 3. Neither of those covers a generated `index.scip` sitting at the repo
+    //    root: it is in no skip dir and no ignore file, and `git grep -I` does
+    //    not help — git's binary heuristic only looks for a NUL byte in the
+    //    first 8000 bytes and this protobuf has none, so git classifies it as
+    //    text and emits raw binary as "matches". `BINARY_EXTS` names the
+    //    formats that produce garbage rather than an answer.
     //
+    //    This is a DENYLIST on purpose. It used to route through
+    //    `travsr_core::is_indexable_path`, an extension ALLOWLIST built for the
+    //    parser walk, which silently dropped every match in a `.sh`, `.sql`,
+    //    `Dockerfile`, `Makefile`, `.lock`, `.txt` or any extensionless file —
+    //    including this repo's own CI gate scripts — and reported a bare "no
+    //    matches" indistinguishable from real absence. find_pattern is a
+    //    textual search, not a parse: anything git will show as text is a
+    //    legitimate answer, so only known-binary formats are removed. `-I`
+    //    above still catches everything with a NUL byte.
+
+    // Extensions whose contents are bytes, not text. `.lsif` is deliberately
+    // absent: LSIF is line-delimited JSON, and a text format belongs in a
+    // textual search.
+    //
+    // Not exhaustive, and it does not have to be: `-I` above already drops
+    // anything with a NUL byte in its first 8 KB. This list only has to cover
+    // the formats git misclassifies as text, so it grows one entry at a time as
+    // one shows up. `pyc`, `pack`, `idx`, `node`, `safetensors` and `parquet`
+    // are here for that reason.
+    const BINARY_EXTS: &[&str] = &[
+        "scip",
+        "db",
+        "sqlite",
+        "onnx",
+        "safetensors",
+        "parquet",
+        "bin",
+        "wasm",
+        "so",
+        "dylib",
+        "dll",
+        "exe",
+        "node",
+        "a",
+        "o",
+        "rlib",
+        "class",
+        "jar",
+        "pyc",
+        "pack",
+        "idx",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "ico",
+        "pdf",
+        "zip",
+        "gz",
+        "tgz",
+        "bz2",
+        "xz",
+        "zst",
+        "tar",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "mp4",
+        "mov",
+        "mp3",
+        "wav",
+    ];
+    let is_binary_ext = |path: &str| {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                let e = e.to_ascii_lowercase();
+                BINARY_EXTS.contains(&e.as_str())
+            })
+    };
+
     // Each grep line is `path:line:col:text`, so the path is the prefix before
     // the first ':'.
     let travsrignore = build_travsrignore_matcher(repo_root);
@@ -2343,6 +2823,9 @@ fn run_git_grep(
                 .components()
                 .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
             if in_skip_dir {
+                return false;
+            }
+            if is_binary_ext(path) {
                 return false;
             }
             match &travsrignore {
@@ -2419,14 +2902,53 @@ pub fn find_pattern_global(
     wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT))
 }
 
+/// Resolve one named registry entry to its live graph.db path.
+///
+/// Mirrors `collect_global`'s stale-entry filter for the single-repo case, for
+/// callers that need to open the store themselves.
+///
+/// Validates with `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`:
+/// every registry key is an absolute repo root, which `validate_mcp_arg` rejects
+/// outright, so a caller could never name a real repo. Same reasoning and same
+/// exact-key-equality use as `observability::resolve_single_repo` (#636) - see
+/// that validator's doc for why the relaxed guard set is safe here.
+fn resolve_repo_db_path<'a>(
+    repos: &'a HashMap<String, PathBuf>,
+    name: &str,
+) -> Option<&'a PathBuf> {
+    // SEC-002: validate repo arg before registry lookup.
+    if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
+        tracing::warn!("get_context_global rejected invalid repo arg: {reason}");
+        return None;
+    }
+    match repos.get(name) {
+        Some(db_path) if db_path.exists() => Some(db_path),
+        Some(db_path) => {
+            tracing::debug!("skipping stale registry entry: {}", db_path.display());
+            None
+        }
+        None => {
+            tracing::warn!("repo '{name}' not found in registry");
+            None
+        }
+    }
+}
+
 fn collect_global(
     repos: &HashMap<String, PathBuf>,
     target_repo: Option<&str>,
     mut f: impl FnMut(&SqliteStore, &str, bool) -> String,
 ) -> String {
     // SEC-002: validate repo arg before registry lookup.
+    //
+    // `validate_mcp_repo_key_arg`, not the shared `validate_mcp_arg`: every
+    // registry key is an absolute repo root, which `validate_mcp_arg` rejects
+    // outright, so every tool routed through here answered an empty result for
+    // any real repo named by `repo`. Same reasoning as `resolve_repo_db_path`
+    // and `observability::resolve_single_repo` (#636) - the value is only ever
+    // compared for exact `HashMap` key equality, never opened as a path.
     if let Some(name) = target_repo {
-        if let Err(reason) = validate_mcp_arg(name) {
+        if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
             tracing::warn!("collect_global rejected invalid repo arg: {reason}");
             return String::new();
         }
@@ -4173,6 +4695,10 @@ pub(crate) fn get_context_authed(
 
 /// Raw variant — returns body without envelope. Used by global aggregation to
 /// prevent double-sanitization when multiple stores are aggregated before wrapping.
+///
+/// Reads the KNN hook off `store` rather than taking it as an argument: in global
+/// mode the caller opens the store and arms it, so hardcoding `None` here left the
+/// semantic lane off for every registry-wide `get_context`.
 pub(crate) fn get_context_raw(
     store: &SqliteStore,
     query: &str,
@@ -4180,6 +4706,7 @@ pub(crate) fn get_context_raw(
     include_snippets: bool,
     snippet_budget: Option<usize>,
 ) -> String {
+    let knn = store.embed_knn_fn();
     get_context_body(
         store,
         query,
@@ -4187,7 +4714,7 @@ pub(crate) fn get_context_raw(
         &OpenFilter,
         include_snippets,
         snippet_budget,
-        None,
+        knn.as_ref().map(|f| f as EmbedKnnFn),
     )
 }
 
@@ -5486,7 +6013,22 @@ fn get_context_body(
     }
 
     // Retrieval header — declared here so it can be prepended to the response body.
-    let n_resolved = seed_set.terms.iter().filter(|t| t.resolved).count();
+    // #529: report the count the abstention gate actually reads, not the looser
+    // `t.resolved` count. They are different numbers under the same name: the gate
+    // additionally requires `idf_w >= idf_coverage_min`, so a query whose tokens
+    // all matched something generic printed e.g. "coverage 4/5" while the gate saw
+    // 0/5 and abstained. An agent reading the envelope could not predict whether it
+    // would get an answer. The generic remainder is still surfaced, distinguished,
+    // because "4 tokens matched but none specifically enough" explains the verdict
+    // that a bare "0/5" only states.
+    let n_resolved = seed_set.n_resolved_gated;
+    let n_resolved_loose = seed_set.terms.iter().filter(|t| t.resolved).count();
+    let n_generic = n_resolved_loose.saturating_sub(n_resolved);
+    let coverage_note = if n_generic > 0 {
+        format!(" (+{n_generic} too generic to count)")
+    } else {
+        String::new()
+    };
     let n_terms = seed_set.terms.len();
 
     // R8: index freshness header — lets the AI know exactly which commit the graph
@@ -5510,7 +6052,7 @@ fn get_context_body(
     let freshness_header = format!("[index commit: {index_commit}, embeddings: {embed_status}]\n");
 
     let retrieval_header = format!(
-        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms} | confidence: {} ]\n",
+        "{freshness_header}[retrieval: {tier_label} | coverage {n_resolved}/{n_terms}{coverage_note} | confidence: {} ]\n",
         seed_set.confidence.label()
     );
 
@@ -6335,21 +6877,31 @@ pub fn get_context_global(
     // R4: use a per-repo header block rather than prefixing every line with
     // "[repo_name]". Per-line prefixing pollutes blank lines, footer lines, and
     // notes with repo tags that look like noise in an LLM context window.
-    let raw = if repo.is_some() {
-        collect_global(repos, repo, |store, repo_name, single| {
-            let result = get_context_raw(
-                store,
-                seed_query,
-                token_budget,
-                include_snippets,
-                snippet_budget,
-            );
-            if result.is_empty() || single {
-                result
-            } else {
-                format!("[repo: {repo_name}]\n{result}")
-            }
-        })
+    // Named repo: open the store here rather than through `collect_global`, which
+    // is shared with the 12 structural tools. Only this path arms the embed
+    // sidecar, so `get_callers` and friends never pay for a model load. With a
+    // single candidate the per-repo `[repo: ...]` header never applied, so it is
+    // not reproduced here.
+    let raw = if let Some(name) = repo {
+        match resolve_repo_db_path(repos, name) {
+            Some(db_path) => match SqliteStore::open_read_only(db_path) {
+                Ok(mut store) => {
+                    crate::inject_embed_hook(&mut store, db_path);
+                    get_context_raw(
+                        &store,
+                        seed_query,
+                        token_budget,
+                        include_snippets,
+                        snippet_budget,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("failed to open {}: {e}", db_path.display());
+                    String::new()
+                }
+            },
+            None => String::new(),
+        }
     } else {
         // Fan-out: rank repos by result size (token-rich responses first).
         let mut candidates: Vec<(&str, &PathBuf)> =
@@ -6360,7 +6912,11 @@ pub fn get_context_global(
         let mut parts: Vec<(usize, String)> = Vec::new();
         for (repo_name, db_path) in &candidates {
             match SqliteStore::open_read_only(db_path) {
-                Ok(store) => {
+                Ok(mut store) => {
+                    // Lookup-only: a fan-out must never arm N sidecars for an
+                    // N-repo registry. A repo an earlier named query warmed keeps
+                    // its semantic lane; an unwarmed one stays lexical.
+                    crate::inject_cached_embed_hook(&mut store, db_path);
                     let result = get_context_raw(
                         &store,
                         seed_query,
@@ -6830,6 +7386,24 @@ fn strip_native_kind_prefix(label: &str) -> &str {
         .unwrap_or(label)
 }
 
+/// Mark the name-matched edges in a `get_graph_json` edge array.
+///
+/// The tree view flagged these and the edge array did not, so a renderer
+/// presented a call `resolve_unresolved_calls` guessed by name as one a
+/// compiler resolved. Derived once from `kind` + `provenance` here rather than
+/// at each of the six sites that build an edge object, all of which already
+/// carry both. Additive: an edge that is not name-matched gains no key.
+fn mark_heuristic_edges(edges: &mut [serde_json::Value]) {
+    for e in edges.iter_mut() {
+        if crate::query::is_heuristic_edge(
+            e["kind"].as_str().unwrap_or_default(),
+            e["provenance"].as_str().unwrap_or_default(),
+        ) {
+            e["heuristic"] = serde_json::Value::Bool(true);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_graph_json_raw(
     store: &SqliteStore,
@@ -7229,6 +7803,7 @@ fn get_graph_json_raw(
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
+    mark_heuristic_edges(&mut edges_out);
     let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
@@ -7548,7 +8123,7 @@ mod tests {
     #[test]
     fn get_callers_global_rejects_path_traversal_repo_arg() {
         let repos: HashMap<String, PathBuf> = HashMap::new();
-        let result = get_callers_global(&repos, "charge", Some("../evil"));
+        let result = get_callers_global(&repos, "charge", None, Some("../evil"));
         // Invalid repo arg must return an empty envelope, not a panic or error.
         assert_eq!(
             result, "<travsr-data></travsr-data>",
@@ -7556,9 +8131,11 @@ mod tests {
         );
     }
 
-    /// SEC-002 end-to-end: an absolute-path repo arg must also be rejected.
+    /// An absolute-path repo arg is a well-formed registry key (every key is an
+    /// absolute repo root), so it is no longer rejected outright; naming one
+    /// that is not registered simply misses and returns the empty envelope.
     #[test]
-    fn get_dependencies_global_rejects_absolute_repo_arg() {
+    fn get_dependencies_global_absolute_repo_arg_that_is_not_registered_is_empty() {
         let repos: HashMap<String, PathBuf> = HashMap::new();
         let result = get_dependencies_global(&repos, "src/main.ts", Some("/etc/passwd"));
         assert_eq!(
@@ -7611,7 +8188,7 @@ mod tests {
             .unwrap();
 
         // Clean run: a confident caller list, no caveat.
-        let clean = get_callers_raw(&store, "charge");
+        let clean = get_callers_raw(&store, "charge", None);
         assert!(
             clean.contains("fn:process"),
             "caller must be listed: {clean}"
@@ -7623,7 +8200,7 @@ mod tests {
 
         // The language crashed: the same answer now carries the caveat.
         store.set_meta("phase_b_warnings", "crashed:rust").unwrap();
-        let crashed = get_callers_raw(&store, "charge");
+        let crashed = get_callers_raw(&store, "charge", None);
         assert!(
             crashed.contains("fn:process"),
             "caller still listed: {crashed}"
@@ -7631,6 +8208,294 @@ mod tests {
         assert!(
             crashed.contains("semantic analysis for 'rust' crashed on its last run"),
             "a crashed language must carry the incompleteness caveat: {crashed}"
+        );
+    }
+
+    /// get_callers used to seed on `search_nodes_by_name(..).first()`, so two
+    /// distinct definitions sharing a name collapsed to whichever one the FTS
+    /// ranked first: it returned that one's callers, said nothing about the
+    /// other, and a reader concluded the unreported definition had no callers.
+    /// `find_references` and `travsr graph` already refuse here; get_callers now
+    /// refuses with them.
+    #[test]
+    fn get_callers_refuses_two_distinct_definitions_of_one_name() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let unifier = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-indexer/src/scip_unifier.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let live = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:candidate_signatures",
+            ),
+            "function",
+        );
+        let unifier_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/scip_unifier.rs",
+                "rust",
+                "fn:unify_one",
+            ),
+            "function",
+        );
+        let live_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "crates/travsr-daemon/src/live_resolve.rs",
+                "rust",
+                "fn:resolve_live",
+            ),
+            "function",
+        );
+        for n in [&unifier, &live, &unifier_caller, &live_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(unifier_caller.id, unifier.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(live_caller.id, live.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "candidate_signatures", None);
+        assert!(
+            out.contains("'candidate_signatures' is ambiguous, 2 definitions"),
+            "two definitions of one name must be refused, not silently picked: {out}"
+        );
+        assert!(
+            out.contains("crates/travsr-indexer/src/scip_unifier.rs")
+                && out.contains("crates/travsr-daemon/src/live_resolve.rs"),
+            "the refusal must name both definitions: {out}"
+        );
+        assert!(
+            !out.contains("fn:unify_one") && !out.contains("fn:resolve_live"),
+            "no single definition's callers may be presented as the answer: {out}"
+        );
+
+        // The `path` hint the refusal advertises is get_callers' own argument, so
+        // the answer is reachable in one more call on the same tool.
+        let pinned = get_callers_raw(&store, "candidate_signatures", Some("scip_unifier.rs"));
+        assert!(
+            !pinned.contains("is ambiguous"),
+            "the path hint the refusal advertises must disambiguate: {pinned}"
+        );
+        assert!(
+            pinned.contains("fn:unify_one") && !pinned.contains("fn:resolve_live"),
+            "only the pinned definition's callers: {pinned}"
+        );
+    }
+
+    /// The guard keys on two *exact definitions*, not on "more than one node
+    /// matched", so the partial matching the get_callers schema documents
+    /// ("partial match supported") still resolves and answers.
+    #[test]
+    fn get_callers_keeps_documented_partial_matching() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("c", "", "svc.rs", "rust", "fn:charge_customer"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("c", "", "main.rs", "rust", "fn:process"),
+            "function",
+        );
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "charge", None);
+        assert!(
+            !out.contains("is ambiguous"),
+            "a partial query is not an ambiguous definition: {out}"
+        );
+        assert!(
+            out.contains("fn:process"),
+            "partial match must still answer: {out}"
+        );
+    }
+
+    /// The `path` hint has to mean the same thing on the partial tier as on the
+    /// exact ones. It used to be dropped once the exact ladder returned `None`,
+    /// so the fallback took the first FTS row and answered about a same-named
+    /// symbol in a file the hint excluded: #647's confident-wrong answer,
+    /// reachable through the one tier that never got the fix.
+    #[test]
+    fn get_callers_partial_fallback_still_honours_the_path_hint() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk =
+            |path: &str, sig: &str| Node::new(VName::new("c", "", path, "rust", sig), "function");
+        // Two partial matches for "charge", in two different directories.
+        let billing = mk("billing/svc.rs", "fn:charge_customer");
+        let payments = mk("payments/svc.rs", "fn:charge_card");
+        let billing_caller = mk("billing/main.rs", "fn:bill_it");
+        let payments_caller = mk("payments/main.rs", "fn:pay_it");
+        for n in [&billing, &payments, &billing_caller, &payments_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(billing_caller.id, billing.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                payments_caller.id,
+                payments.id,
+                EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        let pinned = get_callers_raw(&store, "charge", Some("billing"));
+        assert!(
+            pinned.contains("fn:bill_it"),
+            "the hinted directory's caller must be the answer: {pinned}"
+        );
+        assert!(
+            !pinned.contains("fn:pay_it"),
+            "a caller the hint excludes must not be reported: {pinned}"
+        );
+
+        // A hint matching no candidate must say so. Falling through to the
+        // unscoped first row is what this test exists to stop, and answering an
+        // empty list would read as an authoritative "no callers".
+        let missed = get_callers_raw(&store, "charge", Some("shipping"));
+        assert!(
+            missed.contains("no definition is under path 'shipping'"),
+            "a hint that matches nothing must be reported, not widened: {missed}"
+        );
+        assert!(
+            !missed.contains("fn:bill_it") && !missed.contains("fn:pay_it"),
+            "no caller list may be presented for a hint that matched nothing: {missed}"
+        );
+    }
+
+    /// An Objective-C selector family is one method at several arities, not rival
+    /// definitions (see `RefTarget::Family`). get_callers must union their callers,
+    /// the way find_references unions their sites, never refuse.
+    #[test]
+    fn get_callers_unions_a_selector_family_rather_than_refusing() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let short = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objectivec",
+                "method:AFSecurityPolicy.policyWithPinningMode:",
+            ),
+            "method",
+        );
+        let long = Node::new(
+            VName::new(
+                "c",
+                "",
+                "AFSecurityPolicy.m",
+                "objectivec",
+                "method:AFSecurityPolicy.policyWithPinningMode:withPinnedCertificates:",
+            ),
+            "method",
+        );
+        let short_caller = Node::new(
+            VName::new(
+                "c",
+                "",
+                "Session.m",
+                "objectivec",
+                "method:Session.configure",
+            ),
+            "method",
+        );
+        let long_caller = Node::new(
+            VName::new("c", "", "Pinning.m", "objectivec", "method:Pinning.install"),
+            "method",
+        );
+        for n in [&short, &long, &short_caller, &long_caller] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(short_caller.id, short.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(long_caller.id, long.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let out = get_callers_raw(&store, "policyWithPinningMode", None);
+        assert!(
+            !out.contains("is ambiguous"),
+            "a selector family is one method, not rival definitions: {out}"
+        );
+        assert!(
+            out.contains("Session.configure") && out.contains("Pinning.install"),
+            "every arity's callers must be present: {out}"
+        );
+    }
+
+    /// The family test compares a container NAME cut out of the signature. Two
+    /// classes that share a name (a vendored pod duplicated under two paths, a
+    /// category) are two methods, and unioning them presented one method's
+    /// callers under the other's name. The shared PATH is what tells them apart.
+    #[test]
+    fn two_same_named_classes_are_not_one_selector_family() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for path in ["Pods/A/AFSecurityPolicy.m", "Pods/B/AFSecurityPolicy.m"] {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "c",
+                        "",
+                        path,
+                        "objectivec",
+                        "method:AFSecurityPolicy.policyWithPinningMode:",
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let out = get_callers_raw(&store, "policyWithPinningMode", None);
+        assert!(
+            out.contains("is ambiguous"),
+            "two classes sharing a name are rival definitions, not one family: {out}"
+        );
+    }
+
+    /// The family logic used to be gated on nothing but a trailing ':' in the
+    /// leaf, so it ran for every language.
+    #[test]
+    fn a_non_objc_leaf_ending_in_colon_is_not_a_selector_family() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for sig in ["method:Label.text:", "method:Label.text:color:"] {
+            store
+                .put_node(&Node::new(
+                    VName::new("c", "", "ui.dart", "dart", sig),
+                    "method",
+                ))
+                .unwrap();
+        }
+
+        let out = get_callers_raw(&store, "text", None);
+        assert!(
+            out.contains("is ambiguous"),
+            "only Objective-C spells a method name with embedded colons: {out}"
         );
     }
 
@@ -8017,7 +8882,7 @@ mod tests {
         store
             .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
             .unwrap();
-        let result = get_callers(&store, "fn:callee");
+        let result = get_callers(&store, "fn:callee", None);
         assert!(
             result.contains("src/caller.rs:10"),
             "get_callers must emit path:line for caller, got: {result}"
@@ -8199,7 +9064,7 @@ mod tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let result = get_callers(&store, "SyncPod");
+        let result = get_callers(&store, "SyncPod", None);
         assert!(result.contains("worker.go:4"), "site on line 4: {result}");
         assert!(result.contains("worker.go:6"), "site on line 6: {result}");
         assert!(
@@ -8211,6 +9076,225 @@ mod tests {
             result.matches("worker.go:").count(),
             2,
             "one edge → two call sites: {result}"
+        );
+    }
+
+    /// A recorded occurrence suppresses the textual re-scan for that edge.
+    ///
+    /// The scan counts the callee's name anywhere in the caller's span, so the
+    /// callee's own declaration and a mention in a comment come back as call
+    /// sites. Preferring the recorded rows is what removed 3127 phantom sites
+    /// across 1081 edges on this repo. The scan stays as the fallback for a
+    /// language that feeds no occurrence rows at all.
+    #[test]
+    fn get_callers_prefers_recorded_occurrences_over_the_textual_scan() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        // Three textual hits inside `run`'s span: a comment (3), the local
+        // declaration (4), and the one real call (5).
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "x\nfunction run() {\n  // row is built below\n  const row = () => 1;\n  row();\n}\n",
+        )
+        .unwrap();
+
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let caller = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:run"),
+            "function",
+        )
+        .with_line(2)
+        .with_end_line(6);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.put_node(&callee).unwrap();
+        store.put_node(&caller).unwrap();
+        // An `lsif` edge, so `provenance_marker` is empty and the only marker
+        // in the output is the one the scan itself adds.
+        store
+            .put_edge_lsif(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        // Without occurrence rows the scan still runs: all three lines report.
+        let scanned = get_callers(&store, "row", None);
+        assert_eq!(
+            scanned.matches("app.ts:").count(),
+            3,
+            "the textual fallback is unchanged when nothing was recorded: {scanned}"
+        );
+
+        // With the real occurrence recorded, only that site reports: the
+        // comment and the declaration the scan counted are gone.
+        store
+            .record_edge_sites(&[(caller.id, callee.id, 5, None)])
+            .unwrap();
+        let result = get_callers(&store, "row", None);
+        assert_eq!(
+            result.matches("app.ts:").count(),
+            1,
+            "the recorded occurrence must suppress the scan's phantom sites: {result}"
+        );
+        assert!(
+            result.contains("app.ts:5"),
+            "the surviving site must be the recorded one: {result}"
+        );
+    }
+
+    /// A site whose only backing edge was matched by leaf name must say so.
+    /// `reference_sites` used to select `path` and `line` alone and never touch
+    /// `edges`, the only table holding provenance, so a wholly fabricated site
+    /// was served as a resolved fact.
+    #[test]
+    fn find_references_marks_a_name_matched_site() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let callee = Node::new(
+            VName::new("", "", "grid.ts", "typescript", "fn:row"),
+            "function",
+        );
+        let guessed = Node::new(
+            VName::new("", "", "app.ts", "typescript", "fn:render"),
+            "function",
+        );
+        let resolved = Node::new(
+            VName::new("", "", "page.ts", "typescript", "fn:draw"),
+            "function",
+        );
+        let typed = Node::new(
+            VName::new("", "", "types.ts", "typescript", "fn:shape"),
+            "function",
+        );
+        for n in [&callee, &guessed, &resolved, &typed] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(
+                &Edge::new(guessed.id, callee.id, EdgeKind::RefCall)
+                    .with_provenance("tree-sitter".to_string()),
+            )
+            .unwrap();
+        // `put_edge` hardcodes tree-sitter provenance; the semantic writer is
+        // the one that records a compiler-resolved edge.
+        store
+            .put_edge_lsif(&Edge::new(resolved.id, callee.id, EdgeKind::RefCall))
+            .unwrap();
+        // `typed` has an occurrence but no edge of its own: a resolved
+        // reference that is not a call (#650). Nothing to flag there either.
+        store
+            .record_edge_sites(&[
+                (guessed.id, callee.id, 7, None),
+                (resolved.id, callee.id, 9, None),
+                (typed.id, callee.id, 3, None),
+            ])
+            .unwrap();
+
+        let structured = find_references_structured(&store, "row", None);
+        assert_eq!(structured.total, Some(3));
+        let flags: Vec<(String, bool)> = structured
+            .references
+            .iter()
+            .map(|r| (format!("{}:{}", r.path, r.line), r.heuristic))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("app.ts:7".to_string(), true),
+                ("page.ts:9".to_string(), false),
+                ("types.ts:3".to_string(), false),
+            ],
+            "only the name-matched site is flagged"
+        );
+
+        let text = find_references(&store, "row", None);
+        assert!(
+            text.contains(&format!("app.ts:7{HEURISTIC_MARKER}")),
+            "the name-matched site carries the caveat: {text}"
+        );
+        assert!(
+            !text.contains(&format!("page.ts:9{HEURISTIC_MARKER}")),
+            "the compiler-resolved site carries no caveat: {text}"
+        );
+    }
+
+    /// A name-matched call edge costs one character on the row plus one legend
+    /// line at the end, not 49 bytes on every row. On a Phase-A-only language
+    /// essentially every call edge is name-matched, so the long marker was
+    /// spending the output budget on the caveat instead of on callers.
+    #[test]
+    fn a_name_matched_caller_row_carries_the_sigil_and_one_legend() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let callee = Node::new(VName::new("", "", "grid.go", "go", "fn:row"), "function");
+        let a = Node::new(VName::new("", "", "a.go", "go", "fn:run_a"), "function").with_line(2);
+        let b = Node::new(VName::new("", "", "b.go", "go", "fn:run_b"), "function").with_line(3);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for n in [&callee, &a, &b] {
+            store.put_node(n).unwrap();
+        }
+        for caller in [&a, &b] {
+            store
+                .put_edge(
+                    &Edge::new(caller.id, callee.id, EdgeKind::RefCall)
+                        .with_provenance("tree-sitter".to_string()),
+                )
+                .unwrap();
+        }
+
+        let out = get_callers(&store, "row", None);
+        assert_eq!(
+            out.matches(HEURISTIC_SIGIL_ROW).count(),
+            2,
+            "one sigil per marked row: {out}"
+        );
+        assert_eq!(
+            out.matches(HEURISTIC_LEGEND).count(),
+            1,
+            "the legend is printed once, not per row: {out}"
+        );
+        assert!(
+            !out.contains("[heuristic:"),
+            "the per-row long marker is gone: {out}"
+        );
+    }
+
+    /// Every structural tool routed through `collect_global` takes a `repo`
+    /// argument whose only legal values are the registry's keys, and every key
+    /// is an absolute repo root. The shared `validate_mcp_arg` rejects those
+    /// outright, so naming a real repo returned an empty envelope from all of
+    /// them.
+    #[test]
+    fn a_global_tool_answers_for_a_repo_named_by_its_absolute_key() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            let callee = Node::new(
+                VName::new("", "", "pay.rs", "rust", "fn:charge"),
+                "function",
+            );
+            let caller = Node::new(
+                VName::new("", "", "cart.rs", "rust", "fn:checkout"),
+                "function",
+            );
+            store.put_node(&callee).unwrap();
+            store.put_node(&caller).unwrap();
+            store
+                .put_edge(&Edge::new(caller.id, callee.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        // Registry keys are `repo_root.to_string_lossy()`, i.e. absolute paths.
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key.clone(), db)]);
+
+        let result = get_callers_global(&repos, "charge", None, Some(&key));
+        assert!(
+            result.contains("cart.rs"),
+            "a repo named by its absolute registry key must answer: {result}"
         );
     }
 
@@ -12159,28 +13243,62 @@ mod snippet_tests {
         );
     }
 
-    /// The overlay marker is attached per edge, and only to un-ratified ones.
+    /// The marker is attached per edge, and only where the edge's confidence
+    /// differs from the default: an un-ratified `live` overlay edge, or a
+    /// name-matched (rather than type-resolved) `ref/call`.
     #[test]
-    fn only_a_live_edge_is_marked_in_caller_output() {
+    fn only_a_live_or_heuristic_edge_is_marked_in_caller_output() {
         let ratified = travsr_core::Edge::new(
             travsr_core::NodeId(1),
             travsr_core::NodeId(2),
             travsr_core::EdgeKind::RefCall,
         );
         assert_eq!(
-            live_marker(&ratified),
+            provenance_marker(&ratified),
             "",
             "an unlabelled edge is not marked"
         );
 
-        let mut ts = ratified.clone();
-        ts.provenance = Some("tree-sitter".to_string());
-        assert_eq!(live_marker(&ts), "", "ratified provenance is not marked");
+        let mut scip = ratified.clone();
+        scip.provenance = Some("scip".to_string());
+        assert_eq!(
+            provenance_marker(&scip),
+            "",
+            "a type-resolved edge is not marked"
+        );
+
+        // A `ref/call` labelled tree-sitter came from leaf-name matching in
+        // `resolve_unresolved_calls`, not from a compiler, so it is marked.
+        let mut ts_call = ratified.clone();
+        ts_call.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_call),
+            HEURISTIC_SIGIL_ROW,
+            "a name-matched call edge must carry the sigil"
+        );
+        assert!(
+            HEURISTIC_LEGEND.contains("matched by name, not resolved by type"),
+            "the legend must spell the sigil out in the CLI's words"
+        );
+
+        // Phase A's own structural edges are tree-sitter too, and are facts
+        // read off the AST. They must stay unmarked.
+        let mut ts_structural = travsr_core::Edge::new(
+            travsr_core::NodeId(1),
+            travsr_core::NodeId(2),
+            travsr_core::EdgeKind::DefinesBinding,
+        );
+        ts_structural.provenance = Some("tree-sitter".to_string());
+        assert_eq!(
+            provenance_marker(&ts_structural),
+            "",
+            "a structural Phase A edge is not a name guess"
+        );
 
         let mut live = ratified.clone();
         live.provenance = Some("live".to_string());
         assert!(
-            live_marker(&live).contains("not yet ratified"),
+            provenance_marker(&live).contains("not yet ratified"),
             "a live edge must say so"
         );
     }
@@ -12345,7 +13463,7 @@ mod snippet_tests {
             .unwrap();
         store.set_meta("last_commit", "def456").unwrap();
         store.set_meta("phase_b_commit", "abc123").unwrap();
-        let result = get_callers(&store, "beta");
+        let result = get_callers(&store, "beta", None);
         assert!(
             result.contains("fn:alpha"),
             "existing edges must still be reported; got: {result}"
@@ -13351,7 +14469,7 @@ mod snippet_tests {
     fn find_references_softens_zero_when_target_file_has_no_occurrences() {
         // #450: the language gate passes (another file of the same language has
         // occurrence rows), but the target's OWN file has none — so a definitive
-        // "no recorded uses" would be a claim the index cannot support.
+        // "recorded no uses" would be a claim the index cannot support.
         use travsr_core::{Node, VName};
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
 
@@ -13387,7 +14505,7 @@ mod snippet_tests {
             "should name the unanalysed file: {out}"
         );
         assert!(
-            !out.contains("has no recorded uses"),
+            !out.contains("recorded no uses"),
             "must not assert absence: {out}"
         );
     }
@@ -13423,7 +14541,7 @@ mod snippet_tests {
 
         let out = find_references(&store, "unused", None);
         assert!(
-            out.contains("has no recorded uses"),
+            out.contains("recorded no uses"),
             "analysed file should still give a definitive zero: {out}"
         );
         assert!(
@@ -14008,6 +15126,52 @@ mod snippet_tests {
             !out.contains("dist/bundle.rs") && !out.contains("target/bundle.rs"),
             "a SKIP_DIRS path the walker never indexes must not be searchable, \
              even when no ignore rule covers it: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_searches_text_files_the_parser_does_not_index() {
+        // The filter used to be `travsr_core::is_indexable_path`, an extension
+        // ALLOWLIST, so a match in a `.sh` script or an extensionless file was
+        // dropped and reported as a bare "no matches". Only known-binary
+        // formats are removed now.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("tracked.rs"), "fn charge() {}\n").unwrap();
+        std::fs::write(root.join("deploy.sh"), "# charge the lock\n").unwrap();
+        std::fs::write(root.join("Makefile"), "charge:\n\ttrue\n").unwrap();
+        // A protobuf git classifies as text (no NUL in the first 8000 bytes),
+        // which `-I` therefore lets through.
+        std::fs::write(root.join("index.scip"), "charge\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "charge", None, false);
+        if !out.contains("tracked.rs") {
+            return; // git unavailable in this sandbox
+        }
+        assert!(out.contains("deploy.sh"), "a shell script is text: {out}");
+        assert!(
+            out.contains("Makefile"),
+            "an extensionless file is text: {out}"
+        );
+        assert!(
+            !out.contains("index.scip"),
+            "a binary artifact still must not be searched: {out}"
         );
     }
 
@@ -15157,7 +16321,7 @@ mod issue_755_tests {
             "function",
         );
         store.put_node(&n).unwrap();
-        let out = get_callers(&store, "describe");
+        let out = get_callers(&store, "describe", None);
         assert!(
             out.contains("no call edges were produced for php"),
             "an empty caller list must say why; got: {out}"

@@ -821,6 +821,7 @@ fn dispatch_tool_call(
                 "get_callers" => tools::get_callers_global(
                     repos,
                     args["symbol"].as_str().unwrap_or(""),
+                    args["path"].as_str().filter(|s| !s.is_empty()),
                     repo_arg,
                 ),
                 "get_blast_radius" => {

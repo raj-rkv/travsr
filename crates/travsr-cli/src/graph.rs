@@ -328,29 +328,45 @@ fn print_budget_footer(
 fn print_tree(payload: &GraphPayload) {
     let nodes_by_id: HashMap<u64, &NodeEntry> = payload.nodes.iter().map(|n| (n.id, n)).collect();
     // Children per parent, in BFS discovery order.
-    let mut children: HashMap<u64, Vec<(&str, u64, bool)>> = HashMap::new();
+    let mut children: HashMap<u64, Vec<(&str, u64, bool, bool)>> = HashMap::new();
     for step in &payload.tree {
         children.entry(step.parent).or_default().push((
             step.edge_kind.as_str(),
             step.child,
             step.incoming,
+            step.heuristic,
         ));
     }
+    let mut any_heuristic = false;
     if let Some(seed) = &payload.seed {
-        print_tree_level(seed.id, &nodes_by_id, &children, "");
+        print_tree_level(seed.id, &nodes_by_id, &children, "", &mut any_heuristic);
+    }
+    // Only when a row was actually rendered with the sigil: a legend for a mark
+    // that is not on screen is noise. Kept to one line, and off every row, so
+    // marking these edges costs a tree almost nothing.
+    if any_heuristic {
+        println!();
+        println!("{HEURISTIC_SIGIL} = matched by name, not resolved by type");
     }
 }
+
+/// Suffixes the orientation arrow on a name-matched `ref/call` edge.
+/// The long form of this caveat is what `find_references` prints per site; a
+/// tree repeats the same edge kind on every row, so it gets the compact form
+/// plus one legend line.
+const HEURISTIC_SIGIL: &str = "~";
 
 fn print_tree_level(
     node_id: u64,
     nodes_by_id: &HashMap<u64, &NodeEntry>,
-    children: &HashMap<u64, Vec<(&str, u64, bool)>>,
+    children: &HashMap<u64, Vec<(&str, u64, bool, bool)>>,
     prefix: &str,
+    any_heuristic: &mut bool,
 ) {
     let Some(kids) = children.get(&node_id) else {
         return;
     };
-    for (i, (edge_kind, child_id, incoming)) in kids.iter().enumerate() {
+    for (i, (edge_kind, child_id, incoming, heuristic)) in kids.iter().enumerate() {
         let is_last = i == kids.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let extension = if is_last { "    " } else { "│   " };
@@ -359,9 +375,22 @@ fn print_tree_level(
             // #564: the arrow renders the stored edge orientation — `→` for an
             // outgoing edge (parent → child), `←` for an incoming one (the
             // child calls / contains the parent).
+            //
+            // A name-matched call edge keeps its arrow and gains the sigil: the
+            // tree presented these as fact, identical to a type-resolved edge,
+            // on the surface CLAUDE.md tells agents to run before an edit.
+            // The sigil follows the arrow rather than replacing it, because
+            // `--direction both` mixes orientations on one tree and dropping
+            // the arrow there would trade one silent gap for another.
             let arrow = if *incoming { "←" } else { "→" };
+            let mark = if *heuristic {
+                *any_heuristic = true;
+                HEURISTIC_SIGIL
+            } else {
+                ""
+            };
             println!(
-                "{prefix}{connector}{edge_kind} {arrow} {} ({})",
+                "{prefix}{connector}{edge_kind} {arrow}{mark} {} ({})",
                 child.label, child.kind
             );
             print_tree_level(
@@ -369,6 +398,7 @@ fn print_tree_level(
                 nodes_by_id,
                 children,
                 &format!("{prefix}{extension}"),
+                any_heuristic,
             );
         }
     }
@@ -409,8 +439,15 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
     // Rewrite edges through the redirect table; drop self-loops and duplicates.
     let mut seen: HashSet<(u64, u64, String)> = HashSet::new();
-    let mut edges: Vec<(u64, u64, String)> = Vec::new();
-    for EdgeEntry { src, dst, kind, .. } in &payload.edges {
+    let mut edges: Vec<(u64, u64, String, bool)> = Vec::new();
+    for EdgeEntry {
+        src,
+        dst,
+        kind,
+        heuristic,
+        ..
+    } in &payload.edges
+    {
         let s = import_redirect.get(src).copied().unwrap_or(*src);
         let d = import_redirect.get(dst).copied().unwrap_or(*dst);
         if s == d {
@@ -418,7 +455,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
         }
         let key = (s, d, kind.clone());
         if seen.insert(key) {
-            edges.push((s, d, kind.clone()));
+            edges.push((s, d, kind.clone(), *heuristic));
         }
     }
 
@@ -476,7 +513,7 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
     }
 
     // Emit edges; suppress defines/binding labels from containers to members.
-    for (src_id, dst_id, kind) in &edges {
+    for (src_id, dst_id, kind, heuristic) in &edges {
         let src_kind = nodes_map.get(src_id).map(|n| n.kind.as_str()).unwrap_or("");
         let dst_kind = nodes_map.get(dst_id).map(|n| n.kind.as_str()).unwrap_or("");
 
@@ -486,6 +523,11 @@ fn print_dot(payload: &GraphPayload) -> anyhow::Result<()> {
 
         if suppress {
             println!("  n{src_id} -> n{dst_id};");
+        } else if *heuristic {
+            // Same mark the tree draws, in the form a renderer can show: the
+            // sigil on the label and a dashed line, so a name-matched call is
+            // never read off the picture as one a compiler resolved.
+            println!("  n{src_id} -> n{dst_id} [label=\"{kind} {HEURISTIC_SIGIL}\" style=dashed];");
         } else {
             println!("  n{src_id} -> n{dst_id} [label=\"{kind}\"];");
         }
@@ -573,6 +615,9 @@ fn build_graph_json(
                 "to": to,
                 "kind": e.kind,
                 "provenance": e.provenance,
+                // Additive: the flag the tree view already carries, so a JSON
+                // consumer does not have to re-derive it from kind+provenance.
+                "heuristic": e.heuristic,
             })
         })
         .collect();
@@ -664,6 +709,7 @@ mod tests {
                     .to_string(),
                 dst_sig: "scip:b/Greeter.java:semanticdb maven . . com/b/Greeter#greet()."
                     .to_string(),
+                heuristic: false,
             }],
             tree: vec![],
             coverage: None,

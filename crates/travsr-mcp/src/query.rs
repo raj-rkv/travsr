@@ -100,6 +100,21 @@ pub struct EdgeEntry {
     /// store access (noise endpoints are not in `nodes` but still render).
     pub src_sig: String,
     pub dst_sig: String,
+    /// Same flag as [`TreeStep::heuristic`], on the edge list.
+    ///
+    /// The tree view marked these edges and the `edges` array did not, so
+    /// `--format dot` and `get_graph_json` presented a name-matched call as
+    /// resolved. `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
+}
+
+/// Whether an edge was matched by bare callee name rather than resolved by
+/// type: a `ref/call` that `resolve_unresolved_calls` wrote, not a compiler.
+/// One predicate for both the tree and the edge list so the two views of a
+/// single traversal cannot disagree.
+pub(crate) fn is_heuristic_edge(kind: &str, provenance: &str) -> bool {
+    kind == travsr_core::EdgeKind::RefCall.as_str() && provenance == "tree-sitter"
 }
 
 /// One BFS spanning-tree expansion step, in discovery order — drives the
@@ -115,6 +130,14 @@ pub struct TreeStep {
     /// payloads from daemons predating this field deserializable.
     #[serde(default)]
     pub incoming: bool,
+    /// `true` for a `ref/call` edge whose provenance is `tree-sitter`: one
+    /// `resolve_unresolved_calls` matched by bare callee name, not one a
+    /// compiler resolved by type. Mirrors the condition `provenance_marker` in
+    /// `tools.rs` uses for its `get_callers` sigil, so the tree view and
+    /// `find_references` cannot describe the same edge differently.
+    /// `serde(default)` keeps older daemon payloads deserializable.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Coverage / completeness metadata (#318 O5) — distinguishes "no callers"
@@ -863,7 +886,12 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
     let seed =
         match crate::tools::resolve_reference_targets(store, &args.query, args.path.as_deref()) {
             crate::tools::RefTarget::Unique(n) => Some(n),
-            crate::tools::RefTarget::Ambiguous(list) => {
+            // A selector family is listed like an ambiguity here rather than
+            // merged: a graph has one root, and the arities of a selector are
+            // distinct nodes with distinct neighbourhoods. Naming the full
+            // selector picks one. (`find_references` unions them instead, since
+            // a reference list has no root to conflict over.)
+            crate::tools::RefTarget::Ambiguous(list) | crate::tools::RefTarget::Family(list) => {
                 let candidates_entries: Vec<NodeEntry> =
                     list.iter().map(|n| node_entry(n, 0)).collect();
                 candidates = Some(candidates_entries);
@@ -969,6 +997,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
             } else {
                 (current_id, next_id)
             };
+            let heuristic = is_heuristic_edge(edge_kind.as_str(), &edge_provenance);
             edges_raw.push((src, dst, edge_kind.as_str().to_string(), edge_provenance));
 
             if !visited.contains(&next_id) {
@@ -984,6 +1013,7 @@ pub fn graph_query(store: &SqliteStore, args: &GraphQueryArgs) -> anyhow::Result
                     edge_kind: edge_kind.as_str().to_string(),
                     child: next_id.0,
                     incoming: edge_incoming,
+                    heuristic,
                 });
                 queue.push_back((next_id, depth + 1, child_expand));
             }
@@ -1055,6 +1085,7 @@ fn resolve_edge_sigs(
         edges.push(EdgeEntry {
             src: src.0,
             dst: dst.0,
+            heuristic: is_heuristic_edge(&kind, &provenance),
             kind,
             provenance,
             src_sig: sig_lookup.get(&src.0).cloned().unwrap_or_default(),

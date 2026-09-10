@@ -142,10 +142,13 @@ pub struct AppContainerSpawn {
     /// NOT inherited — `toolchain.env` (JAVA_HOME/GOPATH/…) is forwarded into
     /// it and `~/.travsr/bin` is prepended to PATH, mirroring linux.rs/macos.rs.
     toolchain: crate::sandbox::toolchain::ToolchainAccess,
-    /// Whether the repo root itself needs a write grant (scala's `sbt compile`
-    /// writes `target/` + a settings file into the project root — see
-    /// `toolchain::needs_repo_write`). Every other language stays read-only.
-    repo_write: bool,
+    /// The exact repo-relative subpaths this language's analyzer must write
+    /// (php's `index.scip`, scala's `target/`). The repo root itself always
+    /// stays read-only per ADR-017 Rule 1; each of these gets its own grant.
+    /// Empty for every other language.
+    repo_write: &'static [crate::sandbox::toolchain::RepoWrite],
+    /// The language being analysed, for the grant-skipped diagnostics below.
+    language: String,
     stdin: StdioCfg,
     stdout: StdioCfg,
     stderr: StdioCfg,
@@ -162,6 +165,83 @@ impl AppContainerSpawn {
         self.stderr = cfg;
     }
 
+    /// Materialise and grant this language's repo-write subpaths, leaving the
+    /// repo root itself read-only.
+    ///
+    /// The host creates each path first because an ACL can only be set on an
+    /// object that already exists. Pre-creating is also what keeps the root
+    /// read-only: the analyzer then only needs to open an existing file, not
+    /// FILE_ADD_FILE on the directory holding it.
+    ///
+    /// Best-effort per entry, matching linux.rs: a grant that cannot be
+    /// established costs that language its build output, never the whole spawn.
+    fn grant_repo_write_subpaths(&self, sid: &ffi::AppContainerSid) {
+        for entry in self.repo_write {
+            // A grant path must be a real path inside the repo, never a link out
+            // of it. This code runs UNSANDBOXED as the user, and both the create
+            // below and the ACL write follow reparse points, so a repo shipping
+            // `index.scip` as a link to a file outside the repo would get that
+            // target created and then handed to the sandbox writable.
+            if crate::sandbox::toolchain::grant_path_has_symlink(&self.repo_root, entry.subpath()) {
+                tracing::warn!(
+                    language = %self.language,
+                    subpath = %entry.subpath(),
+                    "repo-write grant skipped: a component of the path is a symlink, \
+                     which would grant its target writable to the sandbox (ADR-017 Rule 1)"
+                );
+                continue;
+            }
+            let host = self.repo_root.join(entry.subpath());
+            let is_dir = match entry {
+                crate::sandbox::toolchain::RepoWrite::Dir(_) => {
+                    let _ = std::fs::create_dir_all(&host);
+                    true
+                }
+                crate::sandbox::toolchain::RepoWrite::File(_) => {
+                    if let Some(parent) = host.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&host);
+                    false
+                }
+            };
+            // Re-stat what the create produced: fail closed if it is a symlink
+            // after all (the check above raced) or if the create failed and left
+            // nothing safe to grant.
+            let is_real = std::fs::symlink_metadata(&host)
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_real {
+                tracing::warn!(
+                    language = %self.language,
+                    subpath = %entry.subpath(),
+                    "repo-write grant skipped: the path is not a real file or directory after \
+                     creating it, so there is nothing safe to grant"
+                );
+                continue;
+            }
+            // A directory grant must inherit so files the analyzer creates under
+            // it are writable too; a file grant must not, or it would leak to
+            // every sibling under the directory holding it.
+            let granted = if is_dir {
+                ffi::grant_path_access(&host, sid.as_psid(), ffi::ACCESS_GENERIC_ALL)
+            } else {
+                ffi::grant_path_access_this_only(&host, sid.as_psid(), ffi::ACCESS_GENERIC_ALL)
+            };
+            if let Err(e) = granted {
+                tracing::warn!(
+                    language = %self.language,
+                    subpath = %entry.subpath(),
+                    err = %e,
+                    "repo-write grant failed, the analyzer may report an empty index"
+                );
+            }
+        }
+    }
+
     /// Spawn the plugin binary inside an AppContainer with a Job Object.
     /// Fail-closed (ADR-017 Rule 2): any setup failure returns `Err`.
     pub(super) fn spawn(self) -> io::Result<AppContainerChild> {
@@ -171,12 +251,15 @@ impl AppContainerSpawn {
         // ── 1–4. AppContainer SID, profile, DACL grants, SECURITY_CAPABILITIES ─
         let sid = ffi::derive_appcontainer_sid(&profile)?;
         ffi::ensure_appcontainer_profile(&profile)?;
-        let repo_access = if self.repo_write {
-            ffi::ACCESS_GENERIC_ALL
-        } else {
-            ffi::ACCESS_GENERIC_READ
-        };
-        ffi::grant_path_access(&self.repo_root, sid.as_psid(), repo_access)?;
+        // ADR-017 Rule 1: the repo root is read-only, on every platform. A
+        // language that must write into its own project tree gets a grant on
+        // exactly those subpaths, layered over the read-only root — never
+        // GENERIC_ALL on the root itself, which would let a hostile
+        // `composer.json` or `build.sbt` rewrite any file in the repo during
+        // indexing. This mirrors the per-subpath `--bind` linux.rs builds and
+        // the per-subpath Seatbelt rules macos.rs emits.
+        ffi::grant_path_access(&self.repo_root, sid.as_psid(), ffi::ACCESS_GENERIC_READ)?;
+        self.grant_repo_write_subpaths(&sid);
         // A direct CreateFile open of repo_root works from the grant above
         // alone, but resolving its REAL/canonical path (GetFinalPathNameByHandleW —
         // what std::fs::canonicalize and Java NIO's Path.toRealPath() both call)
@@ -303,7 +386,8 @@ pub fn build_sandboxed_command(
         scratch_dir: scratch_dir.to_path_buf(),
         policy: policy.clone(),
         toolchain: crate::sandbox::toolchain::toolchain_access(language),
-        repo_write: crate::sandbox::toolchain::needs_repo_write(language),
+        repo_write: crate::sandbox::toolchain::repo_write_subpaths(language),
+        language: language.to_string(),
         stdin: StdioCfg::Inherit,
         stdout: StdioCfg::Inherit,
         stderr: StdioCfg::Inherit,

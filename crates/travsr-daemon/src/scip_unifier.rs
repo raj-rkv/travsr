@@ -115,7 +115,10 @@ pub fn unify_all(
     // re-query without re-parsing the SCIP descriptor.
     // Carries the kind too: the cross-file rung below is restricted by it, and
     // re-deriving it would mean re-parsing the SCIP descriptor.
-    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str)> = Vec::new();
+    // Carries the path and the container-qualified candidates too, for the
+    // overload-collapse rung, which is same-file and ignores line distance.
+    #[allow(clippy::type_complexity)]
+    let mut unmatched: Vec<(NodeId, &str, Vec<String>, &str, &str, Vec<String>)> = Vec::new();
     // #825: first-seen detail for each callable/type SCIP symbol that becomes an
     // attempt, so the residual misses (`attempted - unified`) can be named in
     // `travsr status`. Keyed by scip symbol to match the per-symbol counters.
@@ -138,6 +141,17 @@ pub fn unify_all(
         // re-unified against themselves.
         let (parsed, is_scip) = match travsr_indexer::scip_unifier::scip_name_kind(scip_sym) {
             Some(p) => (p, true),
+            // Scala's sidecar reads SemanticDB, whose symbols are a bare
+            // descriptor chain with none of SCIP's `<scheme> <mgr> <pkg>
+            // <version>` prefix, so `scip_name_kind` rejects all of them. Parsed
+            // as SCIP-shaped rather than Phase-A-shaped, because the descriptor
+            // grammar is SCIP's: `…/Parsers#phrase().`.
+            None if node.vname.language.as_str() == "scala" => {
+                match travsr_indexer::scip_unifier::semanticdb_name_kind(&node.vname.signature) {
+                    Some(p) => (p, true),
+                    None => continue,
+                }
+            }
             None if matches!(node.vname.language.as_str(), "kotlin" | "swift" | "dart") => {
                 match travsr_indexer::scip_unifier::native_name_kind(
                     &node.vname.signature,
@@ -243,7 +257,14 @@ pub fn unify_all(
             Ok(None) if dsl_contained => {
                 dropped.insert(node.id);
             }
-            Ok(None) => unmatched.push((node.id, scip_sym, candidates, parsed.kind)),
+            Ok(None) => unmatched.push((
+                node.id,
+                scip_sym,
+                candidates,
+                parsed.kind,
+                node.vname.path.as_str(),
+                travsr_indexer::scip_unifier::overload_collapse_signatures(&parsed),
+            )),
             Err(e) => tracing::warn!(symbol = %scip_sym, "G1: DB lookup: {e:#}"),
         }
     }
@@ -253,7 +274,7 @@ pub fn unify_all(
     // C/C++ header/source). Alias it onto that node so it is dropped as a
     // duplicate and its edges/refs rewrite onto the real node, and credit its
     // symbol as unified so the miss-rate does not penalize the benign twin.
-    for (node_id, sym, candidates, kind) in unmatched {
+    for (node_id, sym, candidates, kind, path, overload_sigs) in unmatched {
         // Rung 1: the symbol unified in another file, so this occurrence is
         // the benign twin.
         if let Some(&ts_id) = sym_to_ts.get(sym) {
@@ -265,6 +286,40 @@ pub fn unify_all(
                 unified_syms.insert(sym);
             }
             continue;
+        }
+
+        // Rung 1b: the SCIP def is one overload of a method group whose Phase A
+        // node is shared by every overload. Phase A signatures carry no
+        // parameter list, so `C#n().`, `C#n(+1).`, ... all belong to the single
+        // `method:C.n` node anchored at the first overload's span, and every
+        // later overload misses both span-containment and the +/-5 window above.
+        // Resolving that by same-file uniqueness on the *container-qualified*
+        // signature is exact, not heuristic: one match means one method group.
+        //
+        // Measured on the C# fixture (commandlineparser): constructors are the
+        // dominant case, 113 of the 120 unreconciled callable defs. The first
+        // overload of `OptionAttribute` carried 0 ref/call edges while overloads
+        // +1..+4 carried all 103, so the candidate fix alone recovered nothing;
+        // this rung is what makes those edges reachable from the type.
+        //
+        // Placed before rung 2: a same-file qualified match is stronger evidence
+        // than rung 2's corpus-wide uniqueness, and it is checked first so the
+        // wider rung never gets to answer a question this one already can.
+        if !overload_sigs.is_empty() {
+            match store.find_unique_ts_node_in_file(corpus, path, &overload_sigs) {
+                Ok(Some(ts_id)) => {
+                    aliases.push((sym.to_string(), ts_id));
+                    alias_map.insert(node_id, ts_id);
+                    sym_to_ts.entry(sym).or_insert(ts_id);
+                    if attempted_syms.contains(sym) {
+                        unified_syms.insert(sym);
+                    }
+                    tracing::trace!(symbol = %sym, ?ts_id, "G1: unified onto overload group");
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(symbol = %sym, "G1: overload lookup: {e:#}"),
+            }
         }
 
         // Rung 2: the declaration is the *only* Phase A node and it lives in

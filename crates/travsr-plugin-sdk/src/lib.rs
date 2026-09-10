@@ -2,9 +2,9 @@
 //! travsr-plugin-sdk — ergonomic plugin authoring for the Travsr plugin system.
 
 pub use travsr_plugin_protocol::{
-    FfiMarker, FfiMarkerKind, HandshakeRequest, HandshakeResponse, InvokeRequest, InvokeResponse,
-    ParseRequest, ParseResponse, Plugin, PluginError, PluginRequest, PluginResponse,
-    PROTOCOL_VERSION,
+    DiagnosticSeverity, FfiMarker, FfiMarkerKind, HandshakeRequest, HandshakeResponse,
+    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, PluginDiagnostic,
+    PluginError, PluginRequest, PluginResponse, PROTOCOL_VERSION,
 };
 // Embed plugin protocol — RFC-018. Completely separate from the language Plugin system.
 pub use travsr_plugin_protocol::{

@@ -40,6 +40,7 @@ const QUERIES: &str = r"
 (program (variable_declaration (variable_declarator) @topvar))
 (program (export_statement (variable_declaration (variable_declarator) @topvar)))
 (import_statement source: (string (string_fragment) @import.source))
+(export_statement source: (string (string_fragment) @import.source))
 (call_expression
   function: (identifier) @require.fn
   arguments: (arguments . (string (string_fragment) @require.source)))
@@ -268,7 +269,14 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.edges.push(edge);
                 }
                 "import.source" => {
-                    // Import nodes are synthetic — no definition line.
+                    // Import nodes are synthetic, so no definition line.
+                    // Captured from `import ... from "x"` and, since the barrel
+                    // fix, from `export ... from "x"` too: a re-export carries
+                    // exactly the same file dependency, but it is an
+                    // `export_statement`, so the import-only pattern never saw
+                    // it and a barrel file produced no `depends` edge at all.
+                    // That left every importer of a barrel one hop short of the
+                    // real definition for blast radius and import reachability.
                     let node = emit::import_node(corpus, vname_path, text);
                     let edge = emit::depends_edge(file_id, node.id);
                     output.nodes.push(node);
@@ -502,6 +510,87 @@ mod tests {
         assert_eq!(
             imports_of("a.js", "import { Animal } from \"./animal\";\n"),
             imports_of("b.js", "const { Animal } = require(\"./animal\");\n")
+        );
+    }
+
+    /// A barrel re-export (`export ... from "x"`) carries exactly the same
+    /// file dependency as an import, but it is an `export_statement`, so the
+    /// import-only pattern never matched it: a barrel emitted no import node,
+    /// and every importer of the barrel sat one unresolvable hop away from the
+    /// real definition.
+    #[test]
+    fn re_export_emits_an_import_node() {
+        assert_eq!(
+            imports_of("index.ts", "export { makeGreeter } from \"./greeter\";\n"),
+            vec!["import:./greeter"]
+        );
+        assert_eq!(
+            imports_of("star.ts", "export * from \"./util\";\n"),
+            vec!["import:./util"]
+        );
+        assert_eq!(
+            imports_of(
+                "dflt.mjs",
+                "export { default as scale } from \"./util.mjs\";\n"
+            ),
+            vec!["import:./util.mjs"]
+        );
+        // A type-only re-export is the same file dependency.
+        assert_eq!(
+            imports_of("types.ts", "export type { Greeting } from \"./greeter\";\n"),
+            vec!["import:./greeter"]
+        );
+    }
+
+    /// An `export` with no `from` clause names no other file, so it must not
+    /// manufacture an import node.
+    #[test]
+    fn local_export_emits_no_import_node() {
+        assert!(
+            imports_of("m.ts", "export const VERSION = \"1\";\n").is_empty(),
+            "a local const export is not a dependency"
+        );
+        assert!(
+            imports_of("f.ts", "export function run() {}\n").is_empty(),
+            "a local function export is not a dependency"
+        );
+        assert!(
+            imports_of("d.ts", "export default function run() {}\n").is_empty(),
+            "a default export is not a dependency"
+        );
+    }
+
+    /// A re-export must be indistinguishable downstream from a plain import:
+    /// same node signature, and the same `depends` edge out of the file node,
+    /// which is what `link_imports` later turns into a `resolves-to` hop.
+    #[test]
+    fn re_export_is_indistinguishable_from_a_plain_import() {
+        assert_eq!(
+            imports_of("re.ts", "export { A } from \"./a\";\n"),
+            imports_of("im.ts", "import { A } from \"./a\";\n")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barrel.ts");
+        std::fs::write(&path, "export { A } from \"./a\";\n").unwrap();
+        let out = parse("", &path, "barrel.ts").unwrap();
+        let file_id = out
+            .nodes
+            .iter()
+            .find(|n| n.kind == "file")
+            .expect("file node must exist")
+            .id;
+        let import_id = out
+            .nodes
+            .iter()
+            .find(|n| n.vname.signature == "import:./a")
+            .expect("import:./a node must exist")
+            .id;
+        assert!(
+            out.edges.iter().any(|e| e.src == file_id
+                && e.dst == import_id
+                && e.kind == travsr_core::EdgeKind::Depends),
+            "a re-export must emit the same file --depends--> import edge an import does"
         );
     }
 

@@ -26,14 +26,44 @@ pub mod noise;
 /// Version history:
 ///   0 — legacy (no version byte; all pre-RFC-002 databases)
 ///   1 — Tree-sitter vocabulary (`class:X`, `fn:X`, `method:X.Y`, `var:X`)
-///   2 — current: RFC-014 Phase B graph unification. Phase A now captures
+///   2 — RFC-014 Phase B graph unification. Phase A now captures
 ///       type-definition nodes and `end_line` spans that the G1/G2 unification
 ///       passes depend on, so v1 databases lack the tree-sitter nodes that
 ///       SCIP symbols unify onto. Bumping intentionally invalidates every
 ///       existing `.travsr/graph.db` so the daemon skew check and the
 ///       `travsr status` warning force a full re-index (RFC-014 "Re-index
 ///       Policy").
-pub const SIGNATURE_FORMAT_VERSION: u8 = 2;
+///   3 - current: Objective-C method signatures carry the WHOLE selector
+///       (`method:Class.setWidth:height:`) instead of only its leading keyword
+///       (`method:Class.setWidth`). The old form collapsed every selector
+///       sharing a first keyword onto one node, so sibling methods lost their
+///       own identity and calls between them degenerated into self-loops the
+///       store dropped. Node identity therefore changes for every ObjC method.
+///       A v2 database cannot be migrated in place: incremental reindex only
+///       re-parses files that changed, so an ObjC repo would hold collapsed
+///       signatures for untouched files and full selectors for the rest, with
+///       nothing able to tell the halves apart.
+///
+/// The constant does not invalidate anything by itself. It is a marker some code
+/// paths compare against, and only those paths act on a bump:
+///   * The write paths refuse to advance the graph or the freshness marker when
+///     the stored version differs. `reindex_files` (the commit hook and the
+///     watcher) indexes nothing and returns success, logging the reason to the
+///     daemon log so the hook never blocks a commit; `reconcile_head_drift` and
+///     the CLI reindex leave `last_commit` unstamped so freshness is not claimed
+///     for a reindex that never ran.
+///   * `travsr status` is what tells the user, printing the format skew and
+///     asking for a `travsr init`.
+///   * `init_repo_with_progress` reads the stored version before re-stamping it
+///     and, on a mismatch, purges the graph and clears the file-hash cache so
+///     every file is re-parsed, exactly as `--force` does, rather than taking
+///     the incremental path.
+///
+/// Read paths do not check the version at all. `open_read_only` verifies the
+/// schema version only, so queries keep answering from the old-format graph: it
+/// is stale, not corrupt, and the write-path refusals above are what stop the
+/// two formats from ever mixing.
+pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 
@@ -780,6 +810,19 @@ pub struct RefSite {
     pub path: String,
     /// 1-based source line of the occurrence.
     pub line: u32,
+    /// True when at least one `ref/call` edge behind this site carries
+    /// `provenance = 'tree-sitter'`, i.e. it was matched by leaf name rather
+    /// than resolved by a compiler. Such a site can be wholly fabricated: a
+    /// local binding Phase A does not model leaves the only same-named node in
+    /// an unrelated file as the unique winner, and every occurrence enumerated
+    /// under it points at the wrong symbol. Renderers mark these; a `false`
+    /// means either compiler-resolved or (for an occurrence with no edge row of
+    /// its own, e.g. a SCIP type reference) nothing to flag.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes, reading as "nothing to flag" exactly as it did then.
+    #[serde(default)]
+    pub heuristic: bool,
 }
 
 /// Human-readable label for a node in `graph` / reference output.

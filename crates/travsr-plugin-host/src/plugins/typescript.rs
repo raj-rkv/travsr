@@ -156,6 +156,7 @@ impl Plugin for TypeScriptPlugin {
         edges.dedup_by(|a, b| a.src == b.src && a.dst == b.dst && a.kind == b.kind);
 
         InvokeResponse {
+            diagnostics: Vec::new(),
             nodes,
             edges,
             unresolved_calls,

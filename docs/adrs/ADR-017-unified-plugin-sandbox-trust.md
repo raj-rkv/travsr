@@ -37,7 +37,9 @@ Every Sidecar-transport spawn (RFC-011 §2) — whether a Phase B SCIP/LSIF invo
 SandboxPolicy::Standard
   network:    ALLOW             (intentional — see Amendment A1 below)
   filesystem: repo root         → READ-ONLY (narrow build-output exception for
-                                   scala only — see Amendment A5 below)
+                                   scala and php only — the authoritative
+                                   enumeration is Amendment A6 below, which
+                                   supersedes the A5 list)
               scratch tmpdir     → READ-WRITE (per-invocation, removed after)
               everything else    → DENY
   resources:  CPU / RAM / wall-clock caps enforced
@@ -223,6 +225,233 @@ SandboxPolicy::Standard
 > **Approved by:** Principal Security Engineer (PSE review 2026-08-21, PR #743).
 > The narrowed subpath grant and its enforcement test were reviewed and found to
 > confine writes to build outputs only, with source and VCS metadata protected.
+
+> **Amendment A6 — Revised repo-write enumeration: scala crossproject, php, and
+> a symlink guard (2026-09-10)**
+>
+> Amendment A5 authorised exactly three repo-relative write subpaths, all for
+> scala. Two facts observed since then put real Phase B runs outside that list,
+> so the authorised enumeration is revised here rather than drifting in code.
+>
+> **1. scala is a crossproject build, not a single-module one.** An sbt
+> crossproject writes its SemanticDB output per platform. On the pinned
+> scala-parser-combinators fixture all 150 `.semanticdb` files land under
+> `js/target`, `jvm/target` and `native/target` and NONE under the granted
+> `target/`, and sbt's meta-build of the meta-build writes `project/project/target`.
+> Under A5 those writes take EROFS on Linux (the repo root is a `--ro-bind`);
+> macOS runs scala under `Elevated`, which skips Seatbelt, so the mismatch was
+> invisible there.
+>
+> **2. php has a repo-relative output with no redirect flag.** `scip-php` has no
+> `--output`: it hardcodes `index.scip` relative to its working directory, which
+> must be the repo for it to find `composer.json` at all. Denied, its
+> `file_put_contents` returns false with a zero exit status, i.e. a silent empty
+> index rather than a reported failure. The sidecar moves the file into scratch
+> and removes it, so nothing survives the run.
+>
+> The authorised set is therefore (`toolchain::repo_write_subpaths`):
+>
+> ```
+> scala:  target/                    (sbt compile output)
+>         project/target/            (sbt meta-build output)
+>         project/project/target/    (sbt meta-build of the meta-build)
+>         js/target/                 (crossproject, JS platform)
+>         jvm/target/                (crossproject, JVM platform)
+>         native/target/             (crossproject, Native platform)
+>         .travsr-semanticdb.sbt     (the generated SemanticDB-enable settings file)
+>
+> php:    index.scip                 (scip-php's only output path)
+> ```
+>
+> Every other language keeps a fully read-only repo root
+> (`repo_write_subpaths` returns empty for them), and everything under the root
+> outside this list stays READ-ONLY on both bwrap (Linux) and Seatbelt (macOS).
+> The grants are compile-time `&'static str` matched on `language` alone, with no
+> `..` and no repo-controlled input, so a repo still cannot widen its own grant
+> (Rule 3 invariant preserved).
+>
+> **Symlink guard (new requirement).** The host creates each grant path before
+> binding it, and it does so UNSANDBOXED as the user. `create_dir_all`,
+> `OpenOptions::open` and bwrap's `--bind` source resolution all follow symlinks,
+> so a repo shipping `index.scip` (or `target/`) as a link to
+> `~/.ssh/authorized_keys`, `~/.bashrc` or `~/.travsr/lang.toml` would have that
+> target created and then bind-mounted WRITABLE into the sandbox, defeating the
+> A1 compensating control and the A5 residual-risk statement. The Linux path now
+> rejects a grant whose path has a symlink at any component, and re-stats the leaf
+> after creating it, skipping the bind with a warning rather than binding it. It
+> fails closed: a skipped grant costs that language its build output. macOS was
+> never exposed, since a Seatbelt `(literal ...)` rule matches the resolved path.
+>
+> **Residual risk (accepted).** A hostile scala repo's own `build.sbt`, and a
+> hostile php repo's composer configuration, run during indexing (inherent to
+> analysing them) and can write under the listed build directories and the two
+> named files. They still cannot modify source, `.git`, or any path outside the
+> list. php's single grant is a file, not a directory. Pinned by
+> `repo_write_grants_are_exactly_the_authorised_set` (all platforms, enumerates
+> the list so a future widening must be a deliberate test edit),
+> `sandbox_scala_repo_write_is_narrowed_to_build_subpaths` and
+> `sandbox_php_repo_write_is_narrowed_to_index_scip` (Linux, run bwrap on CI), and
+> `sandbox_symlinked_repo_write_grant_is_refused` (Linux).
+>
+> **Scope of the symlink guard (Security review, 2026-09-11).** It closes the
+> threat this ADR models, which is hostile repo *content*: a link committed to
+> the repository, and so present before the run starts, is refused at every
+> component of the grant path. It does NOT close a concurrent local attacker who
+> swaps an intermediate component between the component walk and the
+> `create_dir_all`, because the post-create re-stat checks the leaf only and
+> resolves the components above it. That attacker already has code execution as
+> the user on the machine being indexed, which is outside this ADR's model, so it
+> is accepted rather than mitigated. Closing it properly needs
+> `openat2(RESOLVE_NO_SYMLINKS)` on Linux and the equivalent elsewhere. The
+> earlier wording here claimed the guard meant a grant path "can no longer reach
+> outside the repo", which overstates it; that sentence is removed above.
+>
+> **The host writes into the checkout to establish these grants (Security review,
+> 2026-09-11).** bwrap needs its bind source to exist and a Windows ACL can only
+> be set on an existing object, so the host `create_dir_all`s every `Dir` grant
+> and touches every `File` grant, as the user and UNSANDBOXED, on every run of
+> that language. Indexing a scala repo therefore creates up to six directories
+> and one file in the working tree, and nothing removes them. Not an escape, but
+> it is unrequested mutation of the user's tree by the mechanism that exists to
+> prevent mutation, and it dirties `git status`. Accepted for now, tracked for
+> whoever next touches this path.
+>
+> **`.travsr-semanticdb.sbt` is already vestigial (Security review,
+> 2026-09-11).** travsr-lang#31 (commit `e00ccfc`) replaced the injected settings
+> file with an `sbt` command line, so no current sidecar writes that name. The
+> grant is retained deliberately: already-released sidecars still inject the file
+> and would take EROFS on Linux without it. Drop it once a minimum sidecar
+> version is enforced. The enumeration above therefore lists one grant that is
+> live for old sidecars only.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-09-10 with the fix for the symlinked-grant escape)._
+
+> **Amendment A7 — Windows honours the A6 enumeration per subpath, not as a
+> boolean (2026-09-10)**
+>
+> A6 authorises specific repo-relative subpaths. Linux binds each one and macOS
+> emits a Seatbelt rule for each one, but the Windows AppContainer path read the
+> enumeration through a `needs_repo_write(language) -> bool` helper and, when it
+> was true, granted `ACCESS_GENERIC_ALL` on the **repo root**. That is Rule 1
+> inverted on one platform: a hostile `composer.json` or composer plugin
+> executed during indexing could rewrite any file in the repo, including source
+> and `.git`, where the same language on Linux and macOS may write one file.
+>
+> The helper's own comment justified the coarse bool on the grounds that "scala
+> is `WindowsSandbox::Unsupported` there and never reaches it". That stopped
+> being true when A6 added php, which is `WindowsSandbox::Supported`.
+>
+> Windows now grants `ACCESS_GENERIC_READ` on the repo root unconditionally and
+> a separate `ACCESS_GENERIC_ALL` per authorised subpath, inheritable for a
+> directory grant and this-object-only for a file grant. As on Linux, the host
+> materialises each path first (an ACL can only be set on an object that
+> exists), which is also what lets the root stay read-only: the analyzer opens
+> an existing file rather than needing `FILE_ADD_FILE` on the directory. The
+> symlink guard A6 introduced is now shared by both platforms
+> (`toolchain::grant_path_has_symlink`) instead of living inside the Linux
+> builder, since Windows creates the same paths as the same unsandboxed user.
+> `needs_repo_write` is deleted: with no caller left, keeping it would preserve
+> the shape that caused this.
+>
+> Not verified by execution. The AppContainer tests live in
+> `sandbox-windows.yml`, which is `workflow_dispatch` only and does not run on
+> pull requests, so this change is covered by a Windows-target type-check and by
+> the portable guard unit test, not by a spawn on Windows. Running that workflow
+> before merge is the remaining verification.
+>
+> **A `File` grant is wider than it needs to be (Security review, 2026-09-11).**
+> `ACCESS_GENERIC_ALL` on a file maps to `FILE_ALL_ACCESS`, which includes
+> `DELETE`. A sidecar has no legitimate reason to unlink a file in the user's
+> repository, and granting it opens a one-way door: the delete succeeds, and the
+> recreate then needs `FILE_ADD_FILE` on the repo root, which is deliberately
+> only `ACCESS_GENERIC_READ`. travsr-lang#31 hit exactly that and destroyed the
+> user's `index.scip` on Windows before it was corrected on the sidecar side.
+> The durable fix belongs here, not there: a `RepoWrite::File` should be granted
+> read plus write WITHOUT `DELETE`, so the class is unreachable whatever a
+> sidecar does. Recorded as SEV-4 (defence in depth) rather than a merge blocker,
+> because the sidecar-side fix removes the live exploit path and narrowing the
+> mask is a change to the trust-boundary crate that deserves its own review.
+>
+> **Type-check confirmed (Security review, 2026-09-11).**
+> `cargo check --target x86_64-pc-windows-gnu -p travsr-plugin-host --all-targets`
+> is clean, so the claim above is now evidenced rather than asserted. It is still
+> not a spawn: running `sandbox-windows.yml` before merge remains required.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-09-10)._
+
+> **Amendment A8 — java, kotlin and csharp get the same build-output grant scala
+> already has (2026-09-11)**
+>
+> These three drive the project's own build tool (maven, gradle, dotnet), which
+> writes its output into the project. They held no repo-write grant at all, so on
+> Linux the `--ro-bind` repo root made javac and the SemanticDB compiler plugin
+> take EROFS and the language indexed to nothing. All three are
+> `RequiresElevated`, and macOS skips `sandbox-exec` entirely for that policy, so
+> the gap never showed on the development platform.
+>
+> The authorised set gains:
+>
+> ```
+> java:   target/ build/ .gradle/
+> kotlin: build/ .gradle/ .kotlin/
+> csharp: obj/ bin/
+> ```
+>
+> **Measured, not reasoned.** On Linux under bwrap (arm64, Debian, maven 3.9),
+> with `target/` bound over a read-only repo root: writing new files inside it,
+> deleting files inside it, and deleting its whole CONTENTS all succeed, while a
+> write outside the grant is still denied (EROFS). The single operation that
+> fails is removing the `target` DIRECTORY itself, because that is a write to the
+> read-only parent. By default maven-clean-plugin treats that as fatal:
+> `Failed to delete /repo/target`, BUILD FAILURE, no index at all.
+>
+> The sidecar therefore passes `-Dmaven.clean.failOnError=false`
+> (travsr-lang#31). Re-measured with it: clean still clears the contents, the
+> undeletable directory degrades to a WARNING, javac runs, BUILD SUCCESS. The
+> contents are all `clean` was needed for, since scip-java passes
+> `-Dmaven.compiler.useIncrementalCompilation=false` and clearing the classes is
+> what makes every source stale again. Gradle needs no equivalent, because
+> scip-java drives it through `scipCompileAll` and never runs `clean`.
+>
+> **Residual risk (accepted).** A hostile `pom.xml`, `build.gradle` or `.csproj`
+> executes during indexing, which is inherent to analysing those projects, and
+> can now write under the listed build directories. It still cannot touch source,
+> `.git`, or anything outside the list. This is strictly LESS exposure than the
+> status quo on macOS, where all three run with no filesystem confinement at all.
+> The grants are compile-time `&'static str` matched on `language`, with no `..`
+> and no repo-controlled input, so Rule 3 holds.
+>
+> **All three verified on Linux (2026-09-11).** kotlin and csharp were measured
+> the same way, on the same host, rather than inferred from java.
+>
+> csharp needed nothing beyond `obj/` and `bin/`: `dotnet build --no-restore`
+> inside the sandbox emits its assembly and reports `Build succeeded, 0 Errors`.
+>
+> kotlin needed a directory that inference had missed, and this is the reason
+> the list is measured rather than reasoned. With `build/` and `.gradle/` granted
+> and outputs wiped to force a real compile, `compileKotlin` FAILED on
+> `java.nio.file.FileSystemException:
+> /repo/.kotlin/sessions/kotlin-compiler-*.salive: Read-only file system`. The
+> Kotlin Gradle Plugin opens a build session under `<project>/.kotlin/`. Adding
+> that one directory turns the same build into `BUILD SUCCESSFUL` with the class
+> file written. An earlier run that reported success without it proved nothing:
+> every task was `UP-TO-DATE`, which is why the outputs are wiped first.
+>
+> `.kotlin/` is deliberately NOT on java's list. A pure java gradle build never
+> loads that plugin. A mixed java/kotlin repo that turns out to need it is one
+> line, added when it is observed rather than guessed at now.
+>
+> **Supersedes** the earlier review position that this needed an RFC on the grant
+> mechanism before anything could be granted. That position rested on an
+> unexecuted reading of the bwrap source and, once run, cost four lines and one
+> maven flag.
+>
+> Pinned by `repo_write_grants_are_exactly_the_authorised_set`.
+>
+> **Approved by:** _pending Principal Security Engineer sign-off (drafted
+> 2026-09-11)._
 
 Mechanism by platform (DevOps owns the implementation, Security owns the policy):
 
